@@ -1,0 +1,36 @@
+{
+  "name": "@twasik4/pocket-service",
+  "version": "1.0.4",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "type": "module",
+  "scripts": {
+    "build": "tsdown",
+    "dev": "tsdown --watch",
+    "test": "vitest",
+    "test:watch": "vitest --watch"
+  },
+  "peerDependencies": {
+    "@clickhouse/client": "^1.12.1"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "jose": "^6.2.3",
+    "mongodb": "^6.20.0",
+    "redis": "^5.8.2",
+    "winston": "^3.17.0",
+    "winston-transport": "^4.9.0",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@clickhouse/client": "^1.12.1",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.3",
+    "@types/node": "^24.5.2",
+    "mongodb-memory-server": "^11.0.1",
+    "tsdown": "^0.22.13",
+    "typescript": "^7.0.2",
+    "vitest": "^3.2.4"
+  }
+}
