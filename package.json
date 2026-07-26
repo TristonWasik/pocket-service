@@ -3,6 +3,7 @@
   "version": "1.1.0",
   "description": "Boilerplate-free TypeScript service toolkit with Express, MongoDB, Redis, and ClickHouse support.",
   "license": "MIT",
+  "packageManager": "pnpm@9.0.0",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",
   "exports": {
