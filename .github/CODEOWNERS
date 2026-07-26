@@ -1,0 +1,10 @@
+# Default code owner for the entire repository
+
+- @TristonWasik
+
+# Workflow and release controls
+
+.github/workflows/\* @TristonWasik
+package.json @TristonWasik
+README.md @TristonWasik
+CHANGELOG.md @TristonWasik
