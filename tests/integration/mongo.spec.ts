@@ -3,9 +3,9 @@ import z from "zod";
 import {
   defineMongoCollection,
   MongoCollectionDefinition,
-} from "../src/workers/db/mongo/mongo";
+} from "../../src/modules/mongo/mongo";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { Service } from "../src/workers/service";
+import { Service } from "../../src/core/service";
 
 describe("MongoDB Dependency", () => {
   let service: Service<{
@@ -37,7 +37,7 @@ describe("MongoDB Dependency", () => {
         },
       })
       .build();
-  });
+  }, 30_000);
 
   afterEach(async () => {
     await service.db.testCollection.delete({});

@@ -5,7 +5,7 @@ import {
   createAuthResolver,
   createMetaRouter,
   defaultHeaderAuthResolver,
-} from "../src/workers/express-types";
+} from "../../src/api/express-types";
 
 function createMockResponse() {
   return {

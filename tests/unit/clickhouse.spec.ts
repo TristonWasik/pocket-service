@@ -18,7 +18,7 @@ vi.mock("@clickhouse/client", () => ({
 import {
   createTypedClickhouse,
   defineClickhouseMethod,
-} from "../src/workers/db/clickhouse";
+} from "../../src/modules/clickhouse";
 
 describe("Clickhouse wrapper", () => {
   beforeEach(() => {

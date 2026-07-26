@@ -5,8 +5,8 @@ import {
   createJoseJwtVerifier,
   createJwtAuthStrategy,
   createMtlsAuthStrategy,
-} from "../src/workers/auth/strategies";
-import type { RouteDefinition } from "../src/workers/express-types";
+} from "../../src/auth/strategies";
+import type { RouteDefinition } from "../../src/api/express-types";
 
 const route: RouteDefinition<any, any, boolean> = {
   method: "GET",

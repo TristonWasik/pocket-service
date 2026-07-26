@@ -1,6 +1,6 @@
 import { createClient } from "redis";
 import { parentPort, workerData } from "worker_threads";
-import { RedisStreamEventHandler } from "./workers/stream-handler";
+import { RedisStreamEventHandler } from "./stream-handler";
 
 (async () => {
   const { name, redisUrl, handlers, index, subscriptions } = workerData as {

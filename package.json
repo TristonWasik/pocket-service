@@ -1,14 +1,54 @@
 {
   "name": "@twasik4/pocket-service",
   "version": "1.0.4",
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "description": "Boilerplate-free TypeScript service toolkit with Express, MongoDB, Redis, and ClickHouse support.",
+  "license": "MIT",
+  "main": "dist/index.mjs",
+  "types": "dist/index.d.mts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.mts",
+      "import": "./dist/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/TristonWasik/pocket-service.git"
+  },
+  "bugs": {
+    "url": "https://github.com/TristonWasik/pocket-service/issues"
+  },
+  "homepage": "https://github.com/TristonWasik/pocket-service#readme",
+  "keywords": [
+    "typescript",
+    "express",
+    "service",
+    "mongo",
+    "redis",
+    "clickhouse"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "scripts": {
     "build": "tsdown",
     "dev": "tsdown --watch",
     "test": "vitest",
-    "test:watch": "vitest --watch"
+    "test:unit": "vitest --run tests/unit",
+    "test:integration": "vitest --run tests/integration",
+    "test:watch": "vitest --watch",
+    "prepublishOnly": "pnpm test -- --run && pnpm build",
+    "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {
     "@clickhouse/client": "^1.12.1"

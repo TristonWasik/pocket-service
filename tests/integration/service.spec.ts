@@ -1,11 +1,11 @@
 /// <reference types="vitest/globals" />
 import z from "zod";
-import { defineMongoCollection } from "../src/workers/db/mongo/mongo";
+import { defineMongoCollection } from "../../src/modules/mongo/mongo";
 import { MongoMemoryServer } from "mongodb-memory-server";
-import { Service } from "../src/workers/service";
-import { CustomModules } from "../src/workers/types";
+import { Service } from "../../src/core/service";
+import { CustomModules } from "../../src/core/types";
 import type { Request } from "express";
-import type { RouteDefinition } from "../src/workers/express-types";
+import type { RouteDefinition } from "../../src/api/express-types";
 
 const secureRoute: RouteDefinition<any, any, boolean> = {
   method: "GET",

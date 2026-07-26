@@ -12,6 +12,26 @@ Pocket service comes with the following built-in features:
 - An optional Redis worker module for consuming Redis streams
 - A way to add your own modules/startup hooks that run during the build phase
 
+## Public imports
+
+Import from the package root only:
+
+```ts
+import { Service } from "@twasik4/pocket-service";
+```
+
+Deep imports into `src/*` or `dist/*` are not part of the public API surface.
+
+## Contributor layout
+
+Current source layout:
+
+1. `src/core` for `Service` orchestration and core helpers
+2. `src/api` for Express route metadata/types helpers
+3. `src/auth` for auth strategies
+4. `src/modules` for Mongo/ClickHouse adapters
+5. `src/runtime` for worker runtime and stream handling
+
 ## Service Class API
 
 Use this as the quick reference, then jump to examples.
@@ -142,7 +162,7 @@ const rows = await service.clickhouse.events.select({ type: "user.created" });
 You can also define custom methods with named inputs (`:inputName`) and strong typing:
 
 ```ts
-import { Service, defineClickhouseMethod } from "pocket-service";
+import { Service, defineClickhouseMethod } from "@twasik4/pocket-service";
 
 const service = new Service().withClickhouse({
   url: "http://localhost:8123",

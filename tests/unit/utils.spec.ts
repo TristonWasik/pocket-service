@@ -2,7 +2,7 @@
 import {
   generateRandomHexString,
   getUseableDatesFromMs,
-} from "../src/workers/utils";
+} from "../../src/core/utils";
 
 describe("Utils", () => {
   it("generates a hex string of the requested length", () => {

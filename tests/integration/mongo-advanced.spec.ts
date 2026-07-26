@@ -6,7 +6,7 @@ import {
   createMongo,
   defineMongoCollection,
   type MongoCollectionsConfig,
-} from "../src/workers/db/mongo/mongo";
+} from "../../src/modules/mongo/mongo";
 
 describe("Mongo abstraction advanced behaviors", () => {
   let mongoServer: MongoMemoryServer;

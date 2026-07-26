@@ -5,7 +5,7 @@ import {
   AuthenticatedUser,
   AuthStrategy,
   RouteDefinition,
-} from "../express-types";
+} from "../api/express-types";
 
 type JwtClaimValue = string | string[] | number | boolean | null | undefined;
 

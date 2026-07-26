@@ -1,5 +1,5 @@
 /// <reference types="vitest/globals" />
-import { Service } from "../src/workers/service";
+import { Service } from "../../src/core/service";
 
 describe("Redis Dependency", () => {
   let service: Service<{}>;
