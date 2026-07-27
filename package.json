@@ -1,9 +1,9 @@
 {
   "name": "@twasik4/pocket-service",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Boilerplate-free TypeScript service toolkit with Express, MongoDB, Redis, and ClickHouse support.",
   "license": "MIT",
-  "packageManager": "pnpm@9.0.0",
+  "packageManager": "pnpm@11.17.0",
   "main": "dist/index.mjs",
   "types": "dist/index.d.mts",
   "exports": {
@@ -39,7 +39,7 @@
     "clickhouse"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "type": "module",
   "scripts": {

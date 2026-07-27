@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.1.1 - 2026-07-27
+
+### Changed
+
+- Updated runtime and tooling constraints:
+  - node engines requirement to >=24
+  - packageManager pin to pnpm@11.17.0
+- Hardened GitHub workflows for modern pnpm/Corepack behavior:
+  - disabled interactive Corepack download prompts in CI/publish workflows
+  - ensured workflows continue using pinned v7 action commit SHAs
+- Improved CI reliability for integration tests by setting a workspace-local MongoDB binary cache path in workflow test steps.
+
+### Fixed
+
+- Fixed pnpm workspace build policy configuration by setting valid allowBuilds booleans for esbuild and mongodb-memory-server.
+
 ## 1.1.0 - 2026-07-26
 
 ### Added
