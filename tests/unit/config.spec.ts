@@ -3,7 +3,7 @@ import { Router } from "express";
 
 const { createClientMock, createMongoMock, createTypedClickhouseMock } =
   vi.hoisted(() => ({
-    createClientMock: vi.fn(() => ({ mocked: true })),
+    createClientMock: vi.fn(() => ({ mocked: true, on: vi.fn() })),
     createMongoMock: vi.fn(() => ({ mocked: "mongo" })),
     createTypedClickhouseMock: vi.fn(() => ({ mocked: "clickhouse" })),
   }));
@@ -37,6 +37,7 @@ function makeContext(): ServiceConfigContext {
     dependencyOrder: [],
     log: {
       warn: vi.fn(),
+      error: vi.fn(),
     },
     withoutExpressFlag: false,
     expressOptions: {
@@ -110,9 +111,15 @@ describe("service/config helpers", () => {
     const ctx = makeContext();
     ctx.dependencies.set("redis", { mocked: true });
 
-    addWorkerDependency(ctx, 0, ["a:events", "b:events"]);
+    addWorkerDependency(ctx, 0, ["a:events", "b:events"], {
+      handlersDir: "handlers",
+    });
 
-    expect(ctx.dependencies.get("workers")).toBe(true);
+    expect(ctx.dependencies.get("workers")).toEqual({
+      workerCount: 1,
+      subscriptions: ["a:events", "b:events"],
+      options: { handlersDir: "handlers" },
+    });
     expect(ctx.workerCount).toBe(1);
     expect(ctx.serviceStreamSubscriptions).toEqual(["a:events", "b:events"]);
     expect(ctx.dependencyOrder).toContain("workers");

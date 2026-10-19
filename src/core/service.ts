@@ -1,5 +1,5 @@
 import express, { Express, Router } from "express";
-import { createClient, RedisClientType } from "redis";
+import { RedisClientType } from "redis";
 import { Logger } from "winston";
 import {
   AuthResolver,
@@ -23,10 +23,7 @@ import {
   ServiceLifecycleContext,
 } from "./service/lifecycle";
 import { setupExpressApp, ServiceApiRuntimeContext } from "./service/api";
-import {
-  loadHandlers as loadWorkerHandlers,
-  runWorkers as runWorkerRuntime,
-} from "./service/workers";
+import { startWorkers, WorkerOptions, WorkerPool } from "./service/workers";
 import {
   addAuthStrategies,
   addAuthStrategy,
@@ -90,8 +87,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     ? Number(process.env.SERVICE_PORT)
     : 3100;
   private workerCount: number = 1;
-  private handlers: Record<string, string> = {};
-  private loadedEventListeners: string[] = [];
+  private workerPool: WorkerPool | null = null;
   private routers: {
     base: string;
     router: Router;
@@ -100,7 +96,6 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   private startedAt: number = Date.now();
   private dependencies: Map<string, unknown> = new Map<string, unknown>();
   private dependencyOrder: string[] = [];
-  private isWorkerRunning: boolean = false;
   private serviceStreamSubscriptions: string[] = [];
   private _status: "starting" | "running" | "stopped" | "stopping" = "starting";
   private readonly HEARTBEAT_INTERVAL = 1000 * 5;
@@ -188,6 +183,9 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   private toShutdownContext(): ServiceShutdownContext {
     return {
       dependencies: this.dependencies,
+      stopWorkers: async () => {
+        await this.workerPool?.stop();
+      },
       quitRedis: () => this.redis.quit(),
       disconnectMongo: () => this.mongo.disconnect(),
       closeClickhouse: () => this.clickhouse.client.close(),
@@ -204,8 +202,14 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
       dependencyOrder: this.dependencyOrder,
       dependencies: this.dependencies,
       log: this.log,
-      loadHandlers: () => this.loadHandlers(),
-      runWorkers: () => this.runWorkers(),
+      startWorkers: () => {
+        this.workerPool = startWorkers({
+          name: this.name,
+          dependencies: this.dependencies,
+          log: this.log,
+          redisUrl: this.redis.options?.url,
+        });
+      },
       connectRedis: () => this.redis.connect(),
       register: () => this.register(),
       heartbeat: () => this.heartbeat(),
@@ -231,11 +235,10 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
       startedAt: this.startedAt,
       dependencies: this.dependencies,
       getRoutes: () => this.routes,
-      getLoadedEventListeners: () => this.loadedEventListeners,
-      handlers: this.handlers,
-      getIsWorkerRunning: () => this.isWorkerRunning,
-      streamKey: this.streamKey,
-      simpleName: this.simpleName,
+      getLoadedEventListeners: () => this.workerPool?.loadedHandlers ?? [],
+      getIsWorkerRunning: () => this.workerPool?.isRunning ?? false,
+      getWorkerStatus: () => this.workerPool?.status ?? [],
+      workerSubscriptions: this.serviceStreamSubscriptions,
       getRedis: () => this.redis,
       getAuthResolver: () => this.getAuthResolver(),
       internalAddRouter: (base, router, routes) =>
@@ -423,30 +426,6 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   }
 
   /**
-   * Reads all files in the src/handlers directory and imports them dynamically.
-   */
-  private loadHandlers() {
-    loadWorkerHandlers(
-      this as unknown as Parameters<typeof loadWorkerHandlers>[0],
-    );
-  }
-
-  /**
-   * Spawns worker threads to process messages from Redis streams.
-   * Each worker thread runs the worker-thread.ts file.
-   * Each worker thread is passed the service name, redis URL, and handlers.
-   * Workers communicate back via parentPort to log messages.
-   */
-  private runWorkers(
-    { workerCount }: { workerCount: number } = { workerCount: 1 },
-  ) {
-    runWorkerRuntime(
-      this as unknown as Parameters<typeof runWorkerRuntime>[0],
-      { workerCount },
-    );
-  }
-
-  /**
    * The MongoDB module. This is initialized by calling withMongo() and provides access to the configured MongoDB collections through the `db` property. The MongoDB client will automatically connect when the service is built.
    *
    * @param config MongoDB configuration including URI, database name, and collections.
@@ -546,16 +525,24 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   }
 
   /**
-   * Adds worker threads to the service. These are used to process messages from Redis streams. Worker threads will be spawned when build() is called. This must be called after withRedis() to work properly.
+   * Adds worker threads that consume Redis streams through a consumer group.
+   * Worker threads are spawned when build() is called. Must be called after withRedis().
+   *
+   * Handlers run in separate threads with their own Redis connection, so they
+   * cannot use this service's Mongo/ClickHouse clients. Pass connection info via `options.config`.
    *
    * **Note**: This will not initialize without at least one service stream.
-   * @param workerCount Defaults to 1
-   * @param serviceStreams Defaults to empty array
-   * @returns
+   * @param workerCount Number of worker threads.
+   * @param serviceStreams Streams to consume, e.g. `["auth:events"]`.
+   * @param options Handler directory, retry/timeout tuning, and handler config.
    */
-  withWorkers(workerCount: number, serviceStreams: string[] = []) {
+  withWorkers(
+    workerCount: number,
+    serviceStreams: string[] = [],
+    options: WorkerOptions = {},
+  ) {
     const ctx = this.toConfigContext();
-    addWorkerDependency(ctx, workerCount, serviceStreams);
+    addWorkerDependency(ctx, workerCount, serviceStreams, options);
     this.applyConfigContext(ctx, [
       ...Service.CONFIG_SYNC_KEYS.dependencyGraph,
       ...Service.CONFIG_SYNC_KEYS.workers,

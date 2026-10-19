@@ -51,7 +51,7 @@ Use this as the quick reference, then jump to examples.
 4. `withRedis(url?)` -> [Modules](#modules)
 5. `withMongo(config)` -> [Mongo Collection Helpers](#mongo-collection-helpers)
 6. `withClickhouse(config)` -> [Modules](#modules)
-7. `withWorkers(workerCount, serviceStreams?)` -> [Example: withWorkers](#example-withworkers)
+7. `withWorkers(workerCount, serviceStreams?, options?)` -> [Example: withWorkers](#example-withworkers)
 8. `withModules(customModules)` -> [Modules](#modules)
 9. `withExpressOptions(options)` -> [Example: withExpressOptions](#example-withexpressoptions)
 10. `withAuthStrategy(strategy)` -> [Example: withAuthStrategies (JWT + mTLS)](#example-withauthstrategies-jwt--mtls)
@@ -190,32 +190,64 @@ const typedRows = await service.clickhouse.events.byType({
 
 4. withWorkers()
 
-Adds built-in workers to consume Redis streams off the main loop.
+Consumes Redis streams in worker threads through a consumer group, with retries, a dead-letter queue (DLQ), and recovery of messages abandoned by crashed consumers.
 
 ### Example: withWorkers
 
-`withWorkers` only initializes workers when at least one stream is passed in `serviceStreams`.
+`withWorkers` only initializes workers when at least one stream is passed in `serviceStreams`, and at least one handler file is found.
 
 ```ts
 const service = new Service()
+  .withName("billing")
   .withRedis("redis://localhost:6379")
-  .withWorkers(2, ["auth:events", "billing:events"])
+  .withWorkers(2, ["auth:events", "billing:events"], {
+    handlersDir: "dist/handlers",
+  })
   .build();
 ```
 
-If `serviceStreams` is empty, workers are not initialized.
+Each file in the handlers directory default-exports a `redisStreamHandler` (see [Example: withWorkers + redisStreamHandler](#example-withworkers--redisstreamhandler)). If `handlersDir` is not set, the service looks for `handlers/` next to your entry script, then `src/handlers`. `.js` and `.mjs` files work everywhere. `.ts` files need Node's built-in type stripping.
 
-Worker files are loaded from `src/handlers`.
+Workers run from the built package (`dist/runtime/worker-thread.mjs`).
 
-Additional routes added to Express:
+#### When to use worker threads
 
-| Method | Route                          | Description                                          |
-| ------ | ------------------------------ | ---------------------------------------------------- |
-| GET    | /workers                       | Used for worker health information                   |
-| GET    | /workers/:stream               | Gets all messages from this service's stream         |
-| POST   | /workers/:stream/:id/ack       | Force acknowledge a message in this service's stream |
-| GET    | /workers/:stream/dlq           | Gets all messages from this service's DLQ stream     |
-| POST   | /workers/:stream/dlq/:id/retry | Force retries a message in this service's DLQ stream |
+Reading a stream with `XREADGROUP BLOCK` doesn't block the Node event loop; it only blocks its Redis connection. Worker threads add value when handlers are **CPU-heavy** and would otherwise stall your HTTP routes. Each worker runs in its own isolate with its own Redis connection, so handlers **can't** use this service's `db`, `mongo`, or `clickhouse` clients. Use `ctx.redis`, or pass connection details through `options.config` and create clients inside the handler module.
+
+#### Message format and delivery
+
+- Every stream entry has an `eventType` field, and every other field is a flat string. Handlers are dispatched by `eventType`.
+- `ctx.emit({ type: "audit:user-created", data })` writes `{ eventType: type, ...data }` to `audit:events`. Values are converted to strings, and `null` becomes `""`.
+- The consumer group is `<service name>:consumer-group`, so replicas of the same service share work, and different services each get every message.
+- A failed handler is retried `maxRetries` times with exponential backoff. Each attempt is limited to `timeoutMs`. After the last failure the message is copied to `dlq:<stream>` and acknowledged.
+- Messages left pending for longer than `claimIdleMs`, for example by a crashed worker, are reclaimed with `XAUTOCLAIM`.
+- Messages with no matching handler are acknowledged and skipped.
+- A crashed worker is restarted with backoff, up to `maxRestarts` times. `shutdown()` lets in-flight messages finish before workers exit.
+
+| Option              | Default | Description                                  |
+| ------------------- | ------- | -------------------------------------------- |
+| `handlersDir`       | auto    | Directory of handler modules                 |
+| `config`            | `{}`    | Passed to handlers as `ctx.config`           |
+| `timeoutMs`         | 3000    | Max duration of one handler attempt          |
+| `maxRetries`        | 3       | Attempts before a message goes to the DLQ    |
+| `retryBackoffMs`    | 100     | Base retry delay, doubled each attempt       |
+| `blockMs`           | 5000    | `XREADGROUP` block time                      |
+| `batchSize`         | 10      | Messages per read                            |
+| `claimIdleMs`       | 60000   | Idle time before a pending message is reclaimed |
+| `claimIntervalMs`   | 30000   | How often to check for stale pending messages |
+| `maxRestarts`       | 5       | Restarts per crashed worker                  |
+| `shutdownTimeoutMs` | 10000   | Grace period before workers are terminated   |
+
+Additional routes added to Express (all require auth). `:stream` must be one of the subscribed streams:
+
+| Method | Route                          | Description                                              |
+| ------ | ------------------------------ | -------------------------------------------------------- |
+| GET    | /workers                       | Per-worker state, subscriptions, and loaded handlers     |
+| GET    | /workers/:stream               | Most recent messages (`?count=`, max 100)                |
+| GET    | /workers/:stream/pending       | Pending-entries summary for this service's group         |
+| POST   | /workers/:stream/:id/ack       | Force acknowledge a message                              |
+| GET    | /workers/:stream/dlq           | Most recent DLQ messages (`?count=`, max 100)            |
+| POST   | /workers/:stream/dlq/:id/retry | Re-publish a DLQ message to its stream and remove it from the DLQ |
 
 5. withModules(customModules: CustomModules)
 
@@ -613,6 +645,7 @@ const metrics = defineMongoCollection({
 The package also exports:
 
 - `redisStreamHandler()` to build strongly typed Redis stream handlers
+- `groupName()`, `dlqStream()`, `streamForEventType()` stream naming helpers
 - `createMetaRouter()` and route typing helpers
 - Mongo helpers (`defineMongoCollection`, `createMongo`, `CollectionWrapper`)
 
@@ -621,17 +654,24 @@ Worker handler example:
 ### Example: withWorkers + redisStreamHandler
 
 ```ts
+// src/handlers/user-created.ts
 import { redisStreamHandler } from "@twasik4/pocket-service";
 
-export default redisStreamHandler("user:created", async (event, ctx) => {
-  ctx.log.info(`Handling event for service ${ctx.service}`);
+export default redisStreamHandler("auth:user-created", async (event, ctx) => {
+  ctx.log.info(`${ctx.service} handling ${event.eventType} (${ctx.id})`);
 
   await ctx.emit({
     type: "audit:user-created",
-    data: {
-      userId: String(event.userId || ""),
-      ok: "true",
-    },
+    data: { userId: event.userId, ok: true },
   });
+});
+```
+
+Producing an event from any service:
+
+```ts
+await service.redis.xAdd("auth:events", "*", {
+  eventType: "auth:user-created",
+  userId: "u_123",
 });
 ```

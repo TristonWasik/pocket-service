@@ -14,6 +14,17 @@ jobs:
   test-and-build:
     runs-on: ubuntu-latest
 
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -34,10 +45,12 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Worker thread tests run against the built package.
+      - name: Build
+        run: pnpm build
+
       - name: Run tests
         env:
           MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
+          REDIS_URL: redis://localhost:6379
         run: pnpm test -- --run
-
-      - name: Build
-        run: pnpm build

@@ -1,159 +1,99 @@
-import { createClient } from "redis";
+import { pathToFileURL } from "url";
+import { createClient, RedisClientType } from "redis";
 import { parentPort, workerData } from "worker_threads";
+import { ConsumerOptions, createStreamConsumer } from "./consumer";
 import { RedisStreamEventHandler } from "./stream-handler";
 
-(async () => {
-  const { name, redisUrl, handlers, index, subscriptions } = workerData as {
-    name: string;
-    redisUrl: string;
-    handlers: Record<string, string>;
-    index: number;
-    subscriptions: string[];
-  };
-  const redis = createClient({ url: redisUrl });
-  await redis.connect();
+export type WorkerThreadData = {
+  name: string;
+  redisUrl?: string;
+  handlers: Record<string, string>;
+  index: number;
+  subscriptions: string[];
+  config?: Record<string, unknown>;
+  options?: ConsumerOptions;
+};
 
-  parentPort?.postMessage({
-    level: "info",
-    message: `Connected to Redis at ${redisUrl}`,
-  });
+export type WorkerThreadMessage =
+  | { level: "info" | "warn" | "error"; message: string }
+  | { level: "create"; message: string[] }
+  | { level: "ready" };
 
-  const loadedHandlers = new Map();
+const data = workerData as WorkerThreadData;
 
-  for (const [_, filePath] of Object.entries(handlers)) {
-    const mod = await import(filePath);
-    if (mod.default?.type && mod.default?.execute) {
-      loadedHandlers.set(mod.default.type, mod.default);
-    }
-  }
+function post(msg: WorkerThreadMessage) {
+  parentPort?.postMessage(msg);
+}
 
-  parentPort?.postMessage({
-    level: "create",
-    loadedHandlers: Object.keys(loadedHandlers),
-  });
+const log = {
+  info: (message: string) => post({ level: "info", message }),
+  warn: (message: string) => post({ level: "warn", message }),
+  error: (message: string) => post({ level: "error", message }),
+};
 
-  const stream = `${name}:events`;
-  const group = `${name}-group`;
-  const consumer = `${name}-worker-${index}`;
-  const dlqStream = `dlq:${stream}`;
+function isHandler(value: unknown): value is RedisStreamEventHandler {
+  const candidate = value as RedisStreamEventHandler | undefined;
+  return (
+    typeof candidate?.type === "string" &&
+    typeof candidate?.execute === "function"
+  );
+}
 
-  for (const streamName of subscriptions) {
-    // TODO: infer from handlers
-    try {
-      await redis.xGroupCreate(streamName, group, "0", {
-        MKSTREAM: true,
-      });
-    } catch (error) {
-      if ((error as Error).message.includes("BUSYGROUP")) {
-        parentPort?.postMessage({
-          level: "warn",
-          message: `Group ${group} already exists for stream ${streamName}, skipping creation`,
-        });
-      } else {
-        parentPort?.postMessage({
-          level: "error",
-          message: `Error creating group: ${(error as Error).message}`,
-        });
-      }
-    }
-  }
+async function loadHandlers(files: Record<string, string>) {
+  const loaded = new Map<string, RedisStreamEventHandler>();
 
-  while (true) {
-    const keys = subscriptions.map((s) => ({ key: s, id: ">" })); // TODO: infer from handlers
-    const res = await redis.xReadGroup(group, consumer, keys, {
-      COUNT: 10,
-      BLOCK: 5000,
-    });
-
-    if (!res) {
+  for (const [name, filePath] of Object.entries(files)) {
+    const mod = await import(pathToFileURL(filePath).href);
+    if (!isHandler(mod.default)) {
+      log.warn(
+        `Handler file "${name}" has no default redisStreamHandler export. Skipping.`,
+      );
       continue;
     }
-
-    if (Array.isArray(res)) {
-      for (const { name: streamName, messages } of res as {
-        name: string;
-        messages: {
-          id: string;
-          message: { eventType: string };
-        }[];
-      }[]) {
-        for (const { id, message } of messages) {
-          const eventType = message.eventType;
-          const handler = loadedHandlers.get(
-            eventType,
-          ) as RedisStreamEventHandler;
-
-          if (!handler) {
-            parentPort?.postMessage({
-              level: "error",
-              message: `No handler found for event type: ${eventType}`,
-            });
-            await redis.xAck(stream, group, id);
-            continue;
-          }
-
-          const timeoutMs = 3000;
-          const maxRetries = 3;
-          let attempts = 0;
-
-          while (attempts < maxRetries) {
-            attempts++;
-            try {
-              const result = await Promise.race([
-                await handler.execute(message, {
-                  emit: async (ev) => {
-                    redis.xAdd(
-                      `${ev.type.split(":")[0]}:events`,
-                      "*",
-                      ev as Record<string, any>,
-                    );
-                  },
-                  log: {
-                    info: (msg) =>
-                      parentPort?.postMessage({ level: "info", message: msg }),
-                    warn: (msg) =>
-                      parentPort?.postMessage({ level: "warn", message: msg }),
-                    error: (msg) =>
-                      parentPort?.postMessage({ level: "error", message: msg }),
-                  },
-                  service: streamName,
-                }),
-                new Promise((resolve) =>
-                  setTimeout(() => resolve("timeout"), timeoutMs),
-                ),
-              ]);
-
-              if (result === "timeout") {
-                throw new Error(
-                  `Message processing timed out after ${timeoutMs}ms`,
-                );
-              }
-
-              await redis.xAck(group, group, id);
-              parentPort?.postMessage({
-                level: "info",
-                message: `Message ${id} processed successfully after ${attempts} attempts`,
-              });
-              return;
-            } catch (error) {
-              parentPort?.postMessage({
-                level: "error",
-                message: `Error processing message ${id}: ${
-                  error instanceof Error ? error.message : error
-                }`,
-              });
-              if (attempts === maxRetries) {
-                await redis.xAdd(dlqStream, "*", {
-                  originalId: id,
-                  message: JSON.stringify(message),
-                  error: error instanceof Error ? error.message : String(error),
-                  timestamp: new Date().toISOString(),
-                });
-              }
-            }
-          }
-        }
-      }
+    if (loaded.has(mod.default.type)) {
+      log.warn(
+        `Duplicate handler for event type "${mod.default.type}" in "${name}". Skipping.`,
+      );
+      continue;
     }
+    loaded.set(mod.default.type, mod.default);
   }
-})();
+
+  return loaded;
+}
+
+async function main() {
+  const redis: RedisClientType = createClient({ url: data.redisUrl });
+  redis.on("error", (err: Error) => log.error(`Redis error: ${err.message}`));
+  await redis.connect();
+
+  const handlers = await loadHandlers(data.handlers);
+  post({ level: "create", message: [...handlers.keys()] });
+
+  const consumer = createStreamConsumer({
+    redis,
+    service: data.name,
+    index: data.index,
+    subscriptions: data.subscriptions,
+    handlers,
+    log,
+    config: data.config,
+    options: data.options,
+  });
+
+  parentPort?.on("message", (msg: { type?: string }) => {
+    if (msg?.type !== "stop") return;
+    consumer
+      .stop()
+      .catch((err) => log.error(`Error while stopping: ${err}`))
+      .finally(() => process.exit(0));
+  });
+
+  post({ level: "ready" });
+  await consumer.start();
+}
+
+main().catch((err) => {
+  log.error(`Worker ${data.index} failed: ${err instanceof Error ? err.message : err}`);
+  process.exit(1);
+});

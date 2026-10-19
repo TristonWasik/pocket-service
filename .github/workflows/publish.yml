@@ -10,6 +10,17 @@ jobs:
   publish:
     if: github.event_name == 'workflow_dispatch' || github.event.release.target_commitish == 'main' || github.event.release.target_commitish == 'master'
     runs-on: ubuntu-latest
+
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     environment: release
     permissions:
       contents: read
@@ -37,13 +48,15 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      # Worker thread tests run against the built package.
+      - name: Build
+        run: pnpm build
+
       - name: Run tests
         env:
           MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
+          REDIS_URL: redis://localhost:6379
         run: pnpm test -- --run
-
-      - name: Build
-        run: pnpm build
 
       - name: Publish package
         run: npm publish --provenance --access public
