@@ -43,7 +43,7 @@ describe("Worker threads (built package)", () => {
     admin = createClient({ url: REDIS_URL });
     await admin.connect();
 
-    service = new Service()
+    service = await new Service()
       .withName(`wt-${randomBytes(3).toString("hex")}`)
       .withPort(PORT)
       .withRedis(REDIS_URL)
@@ -63,11 +63,7 @@ describe("Worker threads (built package)", () => {
   });
 
   afterAll(async () => {
-    const exitSpy = vi
-      .spyOn(process, "exit")
-      .mockImplementation((() => undefined) as any);
     await service?.shutdown();
-    exitSpy.mockRestore();
     await admin.del([stream, `dlq:${stream}`, `${stream}:seen`]);
     await admin.close();
   });
@@ -113,12 +109,11 @@ describe("Worker threads (built package)", () => {
   });
 
   it("stops workers on shutdown", async () => {
-    const exitSpy = vi
-      .spyOn(process, "exit")
-      .mockImplementation((() => undefined) as any);
     await service.shutdown();
-    exitSpy.mockRestore();
     expect(service.status).toBe("stopped");
+    expect(
+      service["workerPool"].status.every((w: any) => w.state === "exited"),
+    ).toBe(true);
     service = null;
   });
 });

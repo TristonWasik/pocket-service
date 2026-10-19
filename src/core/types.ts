@@ -1,13 +1,12 @@
 import { NextFunction, Request, Response } from "express";
 import { Logger } from "winston";
 
-export type Message = {
-  type: string;
-  userId: string;
-  teamId: string;
-  timestamp: number;
-  payload: Record<string, string | number | boolean | null>;
+export type Log = {
+  info: (message: string) => void;
+  warn: (message: string) => void;
+  error: (message: string) => void;
 };
+export type ServiceStatus = "starting" | "running" | "stopping" | "stopped";
 export type ExpressMiddleware = (
   req: Request,
   res: Response,

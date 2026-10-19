@@ -1,112 +1,86 @@
-import { CustomModules } from "../types";
-
-type Log = {
-  info: (message: string) => void;
-  warn: (message: string) => void;
-  error: (message: string) => void;
-};
+import { Logger } from "winston";
+import { CustomModules, Log } from "../types";
 
 export type ServiceLifecycleContext = {
-  dependencyOrder: string[];
   dependencies: Map<string, unknown>;
   log: Log;
-  startWorkers: () => void;
   connectRedis: () => Promise<unknown>;
-  register: () => Promise<void>;
-  heartbeat: () => Promise<void>;
-  shutdown: () => Promise<void>;
   connectMongo: () => Promise<unknown>;
-  ensureClickhouseTables: () => Promise<void>;
+  ensureClickhouseTables: () => Promise<unknown>;
+  startWorkers: () => void;
+  register: () => Promise<void>;
+  startHeartbeat: () => void;
+  startHttp: () => Promise<void>;
 };
 
-export function initializeDependencies(ctx: ServiceLifecycleContext) {
-  Promise.allSettled(
-    ctx.dependencyOrder
-      .filter((f) => f !== "customDependencies")
-      .map((key) => {
-        switch (key) {
-          case "redis": {
-            if (ctx.dependencies.has("workers")) {
-              ctx.startWorkers();
-            } else {
-              ctx.log.warn(
-                "Worker module not initialized. Call withWorkers() to enable worker threads and dynamically load handlers.",
-              );
-            }
+function errorMessage(err: unknown) {
+  return err instanceof Error ? err.message : String(err);
+}
 
-            ctx
-              .connectRedis()
-              .then(async () => {
-                ctx.log.info("Redis module loaded");
-                await ctx.register();
-                ctx.log.info("Service registered in Redis");
-                await ctx.heartbeat();
-                ctx.log.info("Heartbeat started");
+/**
+ * Starts every configured dependency and resolves once the service is ready.
+ * Throws on the first failure; the caller is responsible for tearing down
+ * whatever already started.
+ *
+ * Order: core modules (concurrently) -> custom modules (in order) -> workers
+ * -> registry + heartbeat -> HTTP server.
+ */
+export async function startService(ctx: ServiceLifecycleContext) {
+  const core: [string, () => Promise<unknown>][] = [];
+  if (ctx.dependencies.has("redis")) core.push(["redis", ctx.connectRedis]);
+  if (ctx.dependencies.has("mongoClient")) {
+    core.push(["mongoClient", ctx.connectMongo]);
+  }
+  if (ctx.dependencies.has("clickhouse")) {
+    core.push(["clickhouse", ctx.ensureClickhouseTables]);
+  }
 
-                process.on("SIGINT", () => {
-                  ctx.log.info("SIGINT received. Shutting down gracefully...");
-                  void ctx.shutdown();
-                });
-              })
-              .catch((err) => {
-                ctx.log.error(`Failed to load Redis module: ${err}`);
-              });
-            break;
-          }
-          case "mongoClient": {
-            ctx.log.info("Connecting to MongoDB...");
-            ctx
-              .connectMongo()
-              .then(() => {
-                ctx.log.info("Mongo module loaded");
-              })
-              .catch((err) => {
-                ctx.log.error(`Failed to connect to MongoDB: ${err}`);
-                throw err;
-              });
-            break;
-          }
-          case "clickhouse": {
-            ctx.log.info("Connecting to ClickHouse...");
-            ctx
-              .ensureClickhouseTables()
-              .then(() => {
-                ctx.log.info("ClickHouse module loaded");
-              })
-              .catch((err) => {
-                ctx.log.error(`Failed to load ClickHouse module: ${err}`);
-              });
-            break;
-          }
-          default:
-            ctx.log.info(`Unknown module ${key} during initialization.`);
-        }
-      }),
-  ).then((results) => {
-    results.forEach((result, index) => {
-      const key = ctx.dependencyOrder[index];
-
-      if (result.status === "fulfilled") {
-        ctx.log.info(`Module "${key}" initialized successfully.`);
-      } else {
-        ctx.log.error(`Failed to initialize module "${key}": ${result.reason}`);
+  const results = await Promise.allSettled(
+    core.map(async ([name, start]) => {
+      try {
+        await start();
+      } catch (err) {
+        throw new Error(
+          `Failed to initialize module "${name}": ${errorMessage(err)}`,
+          { cause: err },
+        );
       }
-    });
+      ctx.log.info(`Module "${name}" initialized.`);
+    }),
+  );
+  const failure = results.find((r) => r.status === "rejected");
+  if (failure) {
+    throw failure.reason;
+  }
 
-    if (ctx.dependencies.has("customDependencies")) {
-      const customModules = ctx.dependencies.get(
-        "customDependencies",
-      ) as CustomModules;
-
-      for (const module of customModules) {
-        try {
-          module.init(ctx.log as any);
-        } catch (err) {
-          ctx.log.error(
-            `Failed to initialize custom module "${module.name}": ${err}`,
-          );
-        }
-      }
+  const customModules =
+    (ctx.dependencies.get("customDependencies") as CustomModules | undefined) ??
+    [];
+  for (const module of customModules) {
+    let ok: boolean;
+    try {
+      ok = await module.init(ctx.log as Logger);
+    } catch (err) {
+      throw new Error(
+        `Failed to initialize custom module "${module.name}": ${errorMessage(err)}`,
+        { cause: err },
+      );
     }
-  });
+    if (ok === false) {
+      throw new Error(`Custom module "${module.name}" init returned false.`);
+    }
+    ctx.log.info(`Custom module "${module.name}" initialized.`);
+  }
+
+  if (ctx.dependencies.has("workers")) {
+    ctx.startWorkers();
+  }
+
+  if (ctx.dependencies.has("redis")) {
+    await ctx.register();
+    ctx.startHeartbeat();
+    ctx.log.info("Service registered in Redis.");
+  }
+
+  await ctx.startHttp();
 }

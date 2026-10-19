@@ -59,16 +59,11 @@ export class CollectionWrapper<T extends Document> {
    * @returns
    */
   async get(filter: Filter<T> = {}): Promise<WithId<T>[]> {
-    try {
-      if (this.hasProperty("deletedAt")) {
-        // If the schema has a `deletedAt` field, filter out soft-deleted documents
-        filter = { ...filter, deletedAt: { $exists: false } };
-      }
-      const result = await this.collection.find(filter).toArray();
-      return result.map((doc) => this.parseRead(doc));
-    } catch (err) {
-      return [];
+    if (this.hasProperty("deletedAt")) {
+      filter = { ...filter, deletedAt: { $exists: false } };
     }
+    const result = await this.collection.find(filter).toArray();
+    return result.map((doc) => this.parseRead(doc));
   }
 
   /**
@@ -77,16 +72,11 @@ export class CollectionWrapper<T extends Document> {
    * @returns
    */
   async getOne(filter: Filter<T> = {}): Promise<WithId<T> | null> {
-    try {
-      if (this.hasProperty("deletedAt")) {
-        // If the schema has a `deletedAt` field, filter out soft-deleted documents
-        filter = { ...filter, deletedAt: { $exists: false } };
-      }
-      const result = await this.collection.findOne(filter);
-      return result ? this.parseRead(result) : null;
-    } catch (err) {
-      return null;
+    if (this.hasProperty("deletedAt")) {
+      filter = { ...filter, deletedAt: { $exists: false } };
     }
+    const result = await this.collection.findOne(filter);
+    return result ? this.parseRead(result) : null;
   }
 
   /**
@@ -95,17 +85,13 @@ export class CollectionWrapper<T extends Document> {
    * @returns An array of revision documents.
    */
   async getRevisions(filter: Filter<T> = {}): Promise<WithId<T>[]> {
-    try {
-      if (!this.revision) {
-        return [];
-      }
-      const result = await this.revision
-        .find(filter, { sort: { revision: 1 } })
-        .toArray();
-      return result.map((doc) => this.parseRead(doc as WithId<T>));
-    } catch (err) {
+    if (!this.revision) {
       return [];
     }
+    const result = await this.revision
+      .find(filter, { sort: { revision: 1 } })
+      .toArray();
+    return result.map((doc) => this.parseRead(doc as WithId<T>));
   }
 
   /**
@@ -113,18 +99,14 @@ export class CollectionWrapper<T extends Document> {
    * @returns Revision document or null if no revisions exist or if revision tracking is not enabled.
    */
   async getMostRecentRevision(): Promise<WithId<T> | null> {
-    try {
-      if (!this.revision) {
-        return null;
-      }
-      const result = await this.revision
-        .find({}, { sort: { revision: -1 } })
-        .limit(1)
-        .toArray();
-      return result.length > 0 ? this.parseRead(result[0] as WithId<T>) : null;
-    } catch (err) {
+    if (!this.revision) {
       return null;
     }
+    const result = await this.revision
+      .find({}, { sort: { revision: -1 } })
+      .limit(1)
+      .toArray();
+    return result.length > 0 ? this.parseRead(result[0] as WithId<T>) : null;
   }
 
   /**
@@ -208,7 +190,6 @@ export class CollectionWrapper<T extends Document> {
           .toArray();
       }
     } catch (err) {
-      console.error("Failed to update document:", err);
       throw new Error(`Failed to update document: ${(err as Error).message}`);
     }
   }

@@ -1,3 +1,4 @@
+import { Server } from "http";
 import express, { Express, Router } from "express";
 import { RedisClientType } from "redis";
 import { Logger } from "winston";
@@ -10,19 +11,19 @@ import {
 } from "../api/express-types";
 import { ClickhouseConfig, createTypedClickhouse } from "../modules/clickhouse";
 import {
-  createMongo,
   InferMongoCollections,
   MongoCollectionsConfig,
   MongoDatabase,
 } from "../modules/mongo/mongo";
 import { createLogger } from "./logger";
 import { generateRandomHexString } from "./utils";
-import { CustomModules, ExpressOptions } from "./types";
+import { CustomModules, ExpressOptions, ServiceStatus } from "./types";
+import { startService } from "./service/lifecycle";
 import {
-  initializeDependencies,
-  ServiceLifecycleContext,
-} from "./service/lifecycle";
-import { setupExpressApp, ServiceApiRuntimeContext } from "./service/api";
+  closeHttpServer,
+  setupExpressApp,
+  startHttpServer,
+} from "./service/api";
 import { startWorkers, WorkerOptions, WorkerPool } from "./service/workers";
 import {
   addAuthStrategies,
@@ -37,213 +38,74 @@ import {
   disableExpress,
   setAuthResolver,
   setExpressOptions,
-  ServiceConfigContext,
+  ServiceState,
 } from "./service/config";
-import { shutdownService, ServiceShutdownContext } from "./service/shutdown";
+import { shutdownService, ShutdownOptions } from "./service/shutdown";
+import z from "zod/v3";
+
+const DEFAULT_PORT = 3100;
+const HEARTBEAT_INTERVAL_MS = 5_000;
+const REGISTRY_TTL_SECONDS = 30;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15_000;
+const INTERNAL_DEPENDENCIES = new Set(["logger", "expressApp"]);
+
+function envPort() {
+  return Number(process.env.SERVICE_PORT ?? process.env.PORT) || DEFAULT_PORT;
+}
 
 export class Service<TCollections extends MongoCollectionsConfig = {}> {
-  private static readonly CONFIG_SYNC_KEYS = {
-    dependencyGraph: ["dependencies", "dependencyOrder"] as const,
-    workers: ["serviceStreamSubscriptions", "workerCount"] as const,
-    modules: ["dependencies", "dependencyOrder"] as const,
-    expressMode: ["withoutExpressFlag"] as const,
-    expressOptions: ["expressOptions"] as const,
-    authStrategies: ["authStrategies"] as const,
-    authResolver: ["authResolverOverride"] as const,
-    authFallback: ["useDefaultHeaderAuthFallback"] as const,
-    routers: ["routers"] as const,
-  };
-
-  private static readonly CONFIG_SYNC_UNIQUE_KEYS = [
-    "dependencies",
-    "dependencyOrder",
-    "serviceStreamSubscriptions",
-    "workerCount",
-    "withoutExpressFlag",
-    "expressOptions",
-    "authStrategies",
-    "authResolverOverride",
-    "useDefaultHeaderAuthFallback",
-    "routers",
-  ] as const;
-
-  private static readonly CONFIG_SYNC_ALL_KEYS =
-    Service.CONFIG_SYNC_UNIQUE_KEYS;
-
-  private static readonly CONFIG_SYNC_KEY_SET = new Set<string>(
-    Service.CONFIG_SYNC_UNIQUE_KEYS,
-  );
-
-  private static isConfigSyncKey(
-    key: string,
-  ): key is (typeof Service.CONFIG_SYNC_UNIQUE_KEYS)[number] {
-    return Service.CONFIG_SYNC_KEY_SET.has(key);
-  }
-
   private name: string =
     process.env.SERVICE_NAME ?? generateRandomHexString(12);
   private url: string = process.env.SERVICE_URL ?? "http://localhost";
-  private port: number = process.env.SERVICE_PORT
-    ? Number(process.env.SERVICE_PORT)
-    : 3100;
-  private workerCount: number = 1;
-  private workerPool: WorkerPool | null = null;
-  private routers: {
-    base: string;
-    router: Router;
-    routes?: RouteDefinition<any, any, boolean>[];
-  }[] = [];
+  private port: number = envPort();
   private startedAt: number = Date.now();
-  private dependencies: Map<string, unknown> = new Map<string, unknown>();
-  private dependencyOrder: string[] = [];
-  private serviceStreamSubscriptions: string[] = [];
-  private _status: "starting" | "running" | "stopped" | "stopping" = "starting";
-  private readonly HEARTBEAT_INTERVAL = 1000 * 5;
-  private authStrategies: AuthStrategy[] = [];
-  private authResolverOverride?: AuthResolver;
-  private useDefaultHeaderAuthFallback = true;
-  private expressOptions: ExpressOptions = {
-    corsWhitelist: ["*"],
-    asJson: true,
-    customMiddleware: [],
+  private _status: ServiceStatus = "starting";
+
+  private readonly state: ServiceState = {
+    dependencies: new Map<string, unknown>(),
+    dependencyOrder: [],
+    log: {
+      info: (message) => this.log.info(message),
+      warn: (message) => this.log.warn(message),
+      error: (message) => this.log.error(message),
+    },
+    withoutExpressFlag: false,
+    expressOptions: {
+      corsWhitelist: ["*"],
+      asJson: true,
+      customMiddleware: [],
+    },
+    authStrategies: [],
+    authResolverOverride: undefined,
+    useDefaultHeaderAuthFallback: true,
+    serviceStreamSubscriptions: [],
+    workerCount: 1,
+    routers: [],
   };
-  private withoutExpressFlag: boolean = false;
+
+  private workerPool: WorkerPool | null = null;
+  private server: Server | null = null;
+  private heartbeatTimer: NodeJS.Timeout | null = null;
+  private buildPromise: Promise<this> | null = null;
+  private shutdownPromise: Promise<void> | null = null;
+  private signalHandlersEnabled = true;
+  private shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS;
+  private signalHandler: ((signal: NodeJS.Signals) => void) | null = null;
+
+  private get dependencies() {
+    return this.state.dependencies;
+  }
 
   private getAuthResolver(): AuthResolver {
-    if (this.authResolverOverride) {
-      return this.authResolverOverride;
+    if (this.state.authResolverOverride) {
+      return this.state.authResolverOverride;
     }
 
-    return createAuthResolver(this.authStrategies, {
-      fallbackResolver: this.useDefaultHeaderAuthFallback
+    return createAuthResolver(this.state.authStrategies, {
+      fallbackResolver: this.state.useDefaultHeaderAuthFallback
         ? (req) => defaultHeaderAuthResolver(req)
         : undefined,
     });
-  }
-
-  private toConfigContext(): ServiceConfigContext {
-    return {
-      dependencies: this.dependencies,
-      dependencyOrder: this.dependencyOrder,
-      log: this.log,
-      withoutExpressFlag: this.withoutExpressFlag,
-      expressOptions: this.expressOptions,
-      authStrategies: this.authStrategies,
-      authResolverOverride: this.authResolverOverride,
-      useDefaultHeaderAuthFallback: this.useDefaultHeaderAuthFallback,
-      serviceStreamSubscriptions: this.serviceStreamSubscriptions,
-      workerCount: this.workerCount,
-      routers: this.routers,
-    };
-  }
-
-  private applyConfigContext(
-    ctx: ServiceConfigContext,
-    keys: readonly (keyof ServiceConfigContext)[] = Service.CONFIG_SYNC_ALL_KEYS,
-  ) {
-    for (const key of keys) {
-      if (!Service.isConfigSyncKey(key)) {
-        continue;
-      }
-      switch (key) {
-        case "dependencies":
-          this.dependencies = ctx.dependencies;
-          break;
-        case "dependencyOrder":
-          this.dependencyOrder = ctx.dependencyOrder;
-          break;
-        case "serviceStreamSubscriptions":
-          this.serviceStreamSubscriptions = ctx.serviceStreamSubscriptions;
-          break;
-        case "workerCount":
-          this.workerCount = ctx.workerCount;
-          break;
-        case "withoutExpressFlag":
-          this.withoutExpressFlag = ctx.withoutExpressFlag;
-          break;
-        case "expressOptions":
-          this.expressOptions = ctx.expressOptions;
-          break;
-        case "authStrategies":
-          this.authStrategies = ctx.authStrategies;
-          break;
-        case "authResolverOverride":
-          this.authResolverOverride = ctx.authResolverOverride;
-          break;
-        case "useDefaultHeaderAuthFallback":
-          this.useDefaultHeaderAuthFallback = ctx.useDefaultHeaderAuthFallback;
-          break;
-        case "routers":
-          this.routers = ctx.routers;
-          break;
-      }
-    }
-  }
-
-  private toShutdownContext(): ServiceShutdownContext {
-    return {
-      dependencies: this.dependencies,
-      stopWorkers: async () => {
-        await this.workerPool?.stop();
-      },
-      quitRedis: () => this.redis.quit(),
-      disconnectMongo: () => this.mongo.disconnect(),
-      closeClickhouse: () => this.clickhouse.client.close(),
-      log: this.log,
-      name: this.name,
-      setStatus: (status) => {
-        this._status = status;
-      },
-    };
-  }
-
-  private toLifecycleContext(): ServiceLifecycleContext {
-    return {
-      dependencyOrder: this.dependencyOrder,
-      dependencies: this.dependencies,
-      log: this.log,
-      startWorkers: () => {
-        this.workerPool = startWorkers({
-          name: this.name,
-          dependencies: this.dependencies,
-          log: this.log,
-          redisUrl: this.redis.options?.url,
-        });
-      },
-      connectRedis: () => this.redis.connect(),
-      register: () => this.register(),
-      heartbeat: () => this.heartbeat(),
-      shutdown: () => this.shutdown(),
-      connectMongo: () => this.mongo.connect(),
-      ensureClickhouseTables: () => this.clickhouse.ensureTables(),
-    };
-  }
-
-  private toApiRuntimeContext(): ServiceApiRuntimeContext {
-    return {
-      withoutExpressFlag: this.withoutExpressFlag,
-      expressOptions: this.expressOptions,
-      api: this.withoutExpressFlag
-        ? (undefined as unknown as Express)
-        : this.api,
-      routers: this.routers,
-      fullUrl: this.fullUrl,
-      port: this.port,
-      log: this.log,
-      name: this.name,
-      getStatus: () => this.status,
-      startedAt: this.startedAt,
-      dependencies: this.dependencies,
-      getRoutes: () => this.routes,
-      getLoadedEventListeners: () => this.workerPool?.loadedHandlers ?? [],
-      getIsWorkerRunning: () => this.workerPool?.isRunning ?? false,
-      getWorkerStatus: () => this.workerPool?.status ?? [],
-      workerSubscriptions: this.serviceStreamSubscriptions,
-      getRedis: () => this.redis,
-      getAuthResolver: () => this.getAuthResolver(),
-      internalAddRouter: (base, router, routes) =>
-        this.internalAddRouter(base, router, routes),
-    };
   }
 
   get streamKey() {
@@ -259,7 +121,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   }
 
   get api(): Express {
-    if (this.withoutExpressFlag) {
+    if (this.state.withoutExpressFlag) {
       throw new Error(
         "Express server is disabled. Service built without Express.",
       );
@@ -282,7 +144,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   }
 
   get routes() {
-    return this.routers.flatMap(
+    return this.state.routers.flatMap(
       (r) =>
         r.routes?.map((route) => {
           const base = r.base === "/" ? "" : r.base;
@@ -322,9 +184,6 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
    * @requires MongoDB module to be added via withMongo()
    */
   get db(): InferMongoCollections<TCollections> {
-    if (!this.dependencies.has("mongoClient")) {
-      throw new Error("MongoDB module has not been added.");
-    }
     return this.mongo.collections;
   }
 
@@ -355,6 +214,10 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     return this.dependencies.get("redis") as RedisClientType;
   }
 
+  private get registryKey() {
+    return `services:registry:${this.name}`;
+  }
+
   /**
    * Registers the service in Redis for service discovery.
    *
@@ -367,23 +230,25 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
       );
       return;
     }
-    const key = `services:registry:${this.name}`;
     const value = JSON.stringify({
       name: this.name,
       streamKey: this.streamKey,
       url: this.fullUrl,
-      dependencies: Object.keys(this.dependencies),
+      dependencies: [...this.dependencies.keys()].filter(
+        (key) => !INTERNAL_DEPENDENCIES.has(key),
+      ),
       routes: this.routes,
       lastHeartbeat: Date.now(),
     });
 
-    await this.redis.set(key, value, {
-      EX: 30, // TTL of 30 seconds
+    await this.redis.set(this.registryKey, value, {
+      EX: REGISTRY_TTL_SECONDS,
     });
   }
 
   /**
-   * Periodically update the service registration in Redis.
+   * Periodically refreshes the service registration in Redis. Started by
+   * build(); calling it again has no effect.
    *
    * @requires RedisModule to be added via withRedis()
    */
@@ -394,35 +259,131 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
       );
       return;
     }
-    setInterval(async () => {
-      await this.register();
-    }, this.HEARTBEAT_INTERVAL);
+    if (this.heartbeatTimer) return;
+    this.heartbeatTimer = setInterval(() => {
+      this.register().catch((err) =>
+        this.log.error(`Heartbeat failed: ${err}`),
+      );
+    }, HEARTBEAT_INTERVAL_MS);
+    this.heartbeatTimer.unref();
+  }
+
+  private async stopHeartbeat() {
+    if (this.heartbeatTimer) {
+      clearInterval(this.heartbeatTimer);
+      this.heartbeatTimer = null;
+    }
+    if (this.dependencies.has("redis") && this.redis.isOpen) {
+      await this.redis.del(this.registryKey);
+    }
   }
 
   /**
-   * Builds and starts the service by initializing dependencies, setting up routes, and starting the API server.
+   * Starts the service and resolves once it is ready to serve traffic.
    *
-   * The build process includes:
-   * 1. Initializing dependencies in the order they were added (MongoDB, Redis, Clickhouse). This includes the redis workers module if withWorkers() was called.
-   * 2. Initializing any custom modules provided through withModules().
-   * 3. Setting up Express middleware and CORS based on provided options.
-   * 4. Registering default routes like /health and /workers.
-   * 5. Registering any custom routers added through addRouter().
-   * 6. Starting the Express server on the configured port.
+   * 1. Configures Express middleware, CORS, default routes and your routers.
+   * 2. Connects Redis, MongoDB and ClickHouse concurrently.
+   * 3. Runs custom module `init` hooks in order.
+   * 4. Starts workers, registers the service in Redis and starts the heartbeat.
+   * 5. Starts the HTTP server.
+   *
+   * If any step fails, everything already started is shut down and the
+   * returned promise rejects. Calling build() again returns the same promise.
    */
-  build() {
-    try {
-      this._status = "starting";
+  build(): Promise<this> {
+    this.buildPromise ??= this.start();
+    return this.buildPromise;
+  }
 
-      initializeDependencies(this.toLifecycleContext());
-      setupExpressApp(this.toApiRuntimeContext());
+  private async start(): Promise<this> {
+    this._status = "starting";
+    try {
+      if (!this.state.withoutExpressFlag) {
+        setupExpressApp({
+          ...this.state,
+          api: this.api,
+          name: this.name,
+          getStatus: () => this.status,
+          startedAt: this.startedAt,
+          getRoutes: () => this.routes,
+          getLoadedEventListeners: () => this.workerPool?.loadedHandlers ?? [],
+          getIsWorkerRunning: () => this.workerPool?.isRunning ?? false,
+          getWorkerStatus: () => this.workerPool?.status ?? [],
+          workerSubscriptions: this.state.serviceStreamSubscriptions,
+          getRedis: () => this.redis,
+          getAuthResolver: () => this.getAuthResolver(),
+          internalAddRouter: (base, router, routes) => {
+            this.state.routers.push({ base, router, routes });
+          },
+        });
+      }
+
+      await startService({
+        dependencies: this.dependencies,
+        log: this.state.log,
+        connectRedis: () => this.redis.connect(),
+        connectMongo: () => this.mongo.connect(),
+        ensureClickhouseTables: () => this.clickhouse.ensureTables(),
+        startWorkers: () => {
+          this.workerPool = startWorkers({
+            name: this.name,
+            dependencies: this.dependencies,
+            log: this.state.log,
+            redisUrl: this.redis.options?.url,
+          });
+        },
+        register: () => this.register(),
+        startHeartbeat: () => void this.heartbeat(),
+        startHttp: async () => {
+          if (this.state.withoutExpressFlag) return;
+          this.server = await startHttpServer({
+            api: this.api,
+            port: this.port,
+            fullUrl: this.fullUrl,
+            log: this.state.log,
+          });
+        },
+      });
 
       this._status = "running";
+      this.installSignalHandlers();
       return this;
     } catch (err) {
       this.log.error(`Failed to build service: ${err}`);
+      await this.shutdown();
       throw err;
     }
+  }
+
+  private installSignalHandlers() {
+    if (!this.signalHandlersEnabled || this.signalHandler) return;
+
+    this.signalHandler = (signal) => {
+      this.log.info(`${signal} received. Shutting down gracefully...`);
+      setTimeout(() => {
+        this.log.error(
+          `Shutdown did not finish within ${this.shutdownTimeoutMs}ms. Forcing exit.`,
+        );
+        process.exit(1);
+      }, this.shutdownTimeoutMs).unref();
+
+      this.shutdown().then(
+        () => process.exit(0),
+        (err) => {
+          this.log.error(`Shutdown failed: ${err}`);
+          process.exit(1);
+        },
+      );
+    };
+    process.once("SIGINT", this.signalHandler);
+    process.once("SIGTERM", this.signalHandler);
+  }
+
+  private removeSignalHandlers() {
+    if (!this.signalHandler) return;
+    process.off("SIGINT", this.signalHandler);
+    process.off("SIGTERM", this.signalHandler);
+    this.signalHandler = null;
   }
 
   /**
@@ -431,7 +392,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
    * @param config MongoDB configuration including URI, database name, and collections.
    *
    * @example
-   * const t = new Service()
+   * const t = await new Service()
    *   .withMongo({
    *     dbName: "test",
    *     collections: {
@@ -447,14 +408,12 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     uri?: string;
     collections: TNextCollections;
   }) {
-    const ctx = this.toConfigContext();
-    addMongoDependency(ctx, config);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.dependencyGraph);
+    addMongoDependency(this.state, config);
     return this as unknown as Service<TNextCollections>;
   }
 
   /**
-   * The Clickhouse module. This is initialized by calling withClickhouse() and provides access to the configured Clickhouse tables through the `clickhouse` property. The Clickhouse client will automatically connect when the service is built.
+   * The Clickhouse module. This is initialized by calling withClickhouse() and provides access to the configured Clickhouse tables through the `clickhouse` property. Tables are created when the service is built.
    *
    * This module is a **WIP**.
    *
@@ -464,9 +423,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   withClickhouse<TTables extends Record<string, any>>(
     config: ClickhouseConfig<TTables>,
   ) {
-    const ctx = this.toConfigContext();
-    addClickhouseDependency(ctx, config);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.dependencyGraph);
+    addClickhouseDependency(this.state, config);
     return this as Service<TCollections> & {
       clickhouse: ReturnType<typeof createTypedClickhouse<TTables>>;
     };
@@ -476,12 +433,13 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
    * Optional. Port number for the express server.
    *
    * Defaults in the following order:
-   * 1. PORT environment variable
-   * 2. 3100
+   * 1. SERVICE_PORT environment variable
+   * 2. PORT environment variable
+   * 3. 3100
    *
    * @param port port number
    */
-  withPort(port: number = Number(process.env.PORT) || 3100) {
+  withPort(port: number = envPort()) {
     this.port = port;
     return this;
   }
@@ -515,12 +473,15 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
 
   /**
    * The Redis module. This is initialized by calling withRedis() and provides a Redis client instance through the `redis` property. The Redis client will automatically connect when the service is built.
-   * @param url Redis URL. Defaults to: redis://redis:6379
+   *
+   * Defaults in the following order:
+   * 1. REDIS_URL environment variable
+   * 2. "redis://redis:6379"
+   *
+   * @param url Redis URL.
    */
-  withRedis(url: string = "redis://redis:6379") {
-    const ctx = this.toConfigContext();
-    addRedisDependency(ctx, url);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.dependencyGraph);
+  withRedis(url: string = process.env.REDIS_URL ?? "redis://redis:6379") {
+    addRedisDependency(this.state, url);
     return this;
   }
 
@@ -541,74 +502,61 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     serviceStreams: string[] = [],
     options: WorkerOptions = {},
   ) {
-    const ctx = this.toConfigContext();
-    addWorkerDependency(ctx, workerCount, serviceStreams, options);
-    this.applyConfigContext(ctx, [
-      ...Service.CONFIG_SYNC_KEYS.dependencyGraph,
-      ...Service.CONFIG_SYNC_KEYS.workers,
-    ]);
+    addWorkerDependency(this.state, workerCount, serviceStreams, options);
     return this;
   }
 
   /**
-   * Loads custom dependencies that can be used in the service. The factory functions will be called during build() after all other dependencies are loaded and can be used to initialize any custom logic or connections. The result of each factory function will be logged.
-   * @param dependencies Object where keys are dependency names and values are factory functions that return a boolean indicating success or failure of initialization.
+   * Registers custom modules. Each `init` runs during build() after the core modules connect, in the order given; returning `false` or throwing fails the build. `shutdown` hooks run in reverse order.
+   * @param dependencies Modules with a name, an `init` hook and an optional `shutdown` hook.
    */
   withModules(dependencies: CustomModules) {
-    const ctx = this.toConfigContext();
-    addCustomModules(ctx, dependencies);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.modules);
+    addCustomModules(this.state, dependencies);
     return this;
   }
 
   withoutExpress() {
-    const ctx = this.toConfigContext();
-    disableExpress(ctx);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.expressMode);
+    disableExpress(this.state);
     return this;
   }
 
   withExpressOptions(options: Partial<ExpressOptions>) {
-    const ctx = this.toConfigContext();
-    setExpressOptions(ctx, options);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.expressOptions);
+    setExpressOptions(this.state, options);
     return this;
   }
 
   withAuthStrategy(strategy: AuthStrategy) {
-    const ctx = this.toConfigContext();
-    addAuthStrategy(ctx, strategy);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.authStrategies);
+    addAuthStrategy(this.state, strategy);
     return this;
   }
 
   withAuthStrategies(strategies: AuthStrategy[]) {
-    const ctx = this.toConfigContext();
-    addAuthStrategies(ctx, strategies);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.authStrategies);
+    addAuthStrategies(this.state, strategies);
     return this;
   }
 
   withAuthResolver(resolver: AuthResolver) {
-    const ctx = this.toConfigContext();
-    setAuthResolver(ctx, resolver);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.authResolver);
+    setAuthResolver(this.state, resolver);
     return this;
   }
 
   withoutDefaultHeaderAuthFallback() {
-    const ctx = this.toConfigContext();
-    disableDefaultHeaderAuthFallback(ctx);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.authFallback);
+    disableDefaultHeaderAuthFallback(this.state);
     return this;
   }
 
-  private internalAddRouter(
-    base: string,
-    router: Router,
-    routes: RouteDefinition<any, any, boolean>[] = [],
+  /**
+   * Controls the built-in SIGINT/SIGTERM handling. When enabled (the default),
+   * the first signal runs shutdown() and then exits the process, forcing an
+   * exit if shutdown takes longer than `shutdownTimeoutMs`.
+   */
+  withSignalHandlers(
+    enabled: boolean = true,
+    options: { shutdownTimeoutMs?: number } = {},
   ) {
-    this.routers.push({ base, router, routes });
+    this.signalHandlersEnabled = enabled;
+    this.shutdownTimeoutMs =
+      options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     return this;
   }
 
@@ -617,44 +565,62 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
    * @param base Base path for this router.
    * @param router Router instance.
    * @param routes List of route definitions.
-   * @returns
    */
   addRouter(
     base: string,
     router: Router,
     routes: RouteDefinition<any, any, boolean>[] = [],
   ) {
-    const ctx = this.toConfigContext();
-    addRouterRegistration(ctx, base, router, routes);
-    this.applyConfigContext(ctx, Service.CONFIG_SYNC_KEYS.routers);
+    addRouterRegistration(this.state, base, router, routes);
     return this;
   }
 
   /**
-   * Gracefully shuts down the service by closing all connections and active workers.
+   * Gracefully shuts down the service: stops accepting HTTP requests, drains
+   * workers, removes the registry entry, runs custom shutdown hooks, and
+   * closes ClickHouse, MongoDB and Redis. Does not exit the process.
+   *
+   * Calling it more than once returns the same promise.
    */
-  async shutdown(
-    opts: {
-      /**
-       * Optional callback to run before shutdown. Can be used to perform cleanup tasks like closing database connections, etc.
-       */
-      beforeShutdown?: () => Promise<void>;
-      /**
-       * Optional callback to run after shutdown. Can be used to perform any final tasks before the process exits.
-       */
-      afterShutdown?: () => Promise<void>;
-    } = {},
-  ) {
-    await shutdownService(this.toShutdownContext(), opts);
+  shutdown(opts: ShutdownOptions = {}): Promise<void> {
+    this.shutdownPromise ??= this.stop(opts);
+    return this.shutdownPromise;
   }
 
-  [Symbol.dispose]() {
-    this.shutdown();
+  private async stop(opts: ShutdownOptions) {
+    this.removeSignalHandlers();
+    await shutdownService(
+      {
+        dependencies: this.dependencies,
+        log: this.state.log,
+        name: this.name,
+        setStatus: (status) => {
+          this._status = status;
+        },
+        closeHttp: async () => {
+          if (!this.server) return;
+          await closeHttpServer(this.server);
+          this.server = null;
+        },
+        stopWorkers: async () => {
+          await this.workerPool?.stop();
+        },
+        stopHeartbeat: () => this.stopHeartbeat(),
+        closeRedis: async () => {
+          if (this.redis.isOpen) await this.redis.close();
+        },
+        disconnectMongo: () => this.mongo.disconnect(),
+        closeClickhouse: () => this.clickhouse.client.close(),
+      },
+      opts,
+    );
+  }
+
+  async [Symbol.asyncDispose]() {
+    await this.shutdown();
   }
 
   *[Symbol.iterator]() {
-    for (const dependency of Object.values(this.dependencies)) {
-      yield dependency;
-    }
+    yield* this.dependencies.values();
   }
 }

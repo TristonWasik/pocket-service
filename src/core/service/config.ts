@@ -10,15 +10,20 @@ import {
   createTypedClickhouse,
 } from "../../modules/clickhouse";
 import { createMongo, MongoCollectionsConfig } from "../../modules/mongo/mongo";
-import { CustomModules, ExpressOptions } from "../types";
+import { CustomModules, ExpressOptions, Log } from "../types";
 import type { WorkerDependency, WorkerOptions } from "./workers";
 
-type Log = {
-  warn: (message: string) => void;
-  error: (message: string) => void;
+export type RouterRegistration = {
+  base: string;
+  router: Router;
+  routes?: RouteDefinition<any, any, boolean>[];
 };
 
-export type ServiceConfigContext = {
+/**
+ * Mutable configuration owned by a Service. The builder helpers below mutate
+ * it in place.
+ */
+export type ServiceState = {
   dependencies: Map<string, unknown>;
   dependencyOrder: string[];
   log: Log;
@@ -29,17 +34,13 @@ export type ServiceConfigContext = {
   useDefaultHeaderAuthFallback: boolean;
   serviceStreamSubscriptions: string[];
   workerCount: number;
-  routers: {
-    base: string;
-    router: Router;
-    routes?: RouteDefinition<any, any, boolean>[];
-  }[];
+  routers: RouterRegistration[];
 };
 
 export function addMongoDependency<
   TNextCollections extends MongoCollectionsConfig,
 >(
-  ctx: ServiceConfigContext,
+  ctx: ServiceState,
   config: {
     dbName: string;
     uri?: string;
@@ -56,7 +57,7 @@ export function addMongoDependency<
 }
 
 export function addClickhouseDependency<TTables extends Record<string, any>>(
-  ctx: ServiceConfigContext,
+  ctx: ServiceState,
   config: ClickhouseConfig<TTables>,
 ) {
   if (!ctx.dependencies.has("clickhouse")) {
@@ -65,14 +66,9 @@ export function addClickhouseDependency<TTables extends Record<string, any>>(
   }
 }
 
-export function addRedisDependency(
-  ctx: ServiceConfigContext,
-  url: string = "redis://redis:6379",
-) {
+export function addRedisDependency(ctx: ServiceState, url: string) {
   if (!ctx.dependencies.has("redis")) {
     const client = createClient({ url });
-    // Without a listener, a dropped connection emits an unhandled 'error'
-    // event and crashes the process. node-redis reconnects on its own.
     client.on("error", (err: Error) =>
       ctx.log.error(`Redis error: ${err.message}`),
     );
@@ -82,7 +78,7 @@ export function addRedisDependency(
 }
 
 export function addWorkerDependency(
-  ctx: ServiceConfigContext,
+  ctx: ServiceState,
   workerCount: number,
   serviceStreams: string[] = [],
   options: WorkerOptions = {},
@@ -106,10 +102,7 @@ export function addWorkerDependency(
   }
 }
 
-export function addCustomModules(
-  ctx: ServiceConfigContext,
-  modules: CustomModules,
-) {
+export function addCustomModules(ctx: ServiceState, modules: CustomModules) {
   if (!ctx.dependencies.has("customDependencies")) {
     ctx.dependencies.set(
       "customDependencies",
@@ -123,12 +116,12 @@ export function addCustomModules(
   }
 }
 
-export function disableExpress(ctx: ServiceConfigContext) {
+export function disableExpress(ctx: ServiceState) {
   ctx.withoutExpressFlag = true;
 }
 
 export function setExpressOptions(
-  ctx: ServiceConfigContext,
+  ctx: ServiceState,
   options: Partial<ExpressOptions>,
 ) {
   if (ctx.withoutExpressFlag) {
@@ -140,10 +133,7 @@ export function setExpressOptions(
   ctx.expressOptions = { ...ctx.expressOptions, ...options };
 }
 
-export function addAuthStrategy(
-  ctx: ServiceConfigContext,
-  strategy: AuthStrategy,
-) {
+export function addAuthStrategy(ctx: ServiceState, strategy: AuthStrategy) {
   if (ctx.withoutExpressFlag) {
     ctx.log.warn(
       "Express server is disabled. Auth strategies will not be applied.",
@@ -154,7 +144,7 @@ export function addAuthStrategy(
 }
 
 export function addAuthStrategies(
-  ctx: ServiceConfigContext,
+  ctx: ServiceState,
   strategies: AuthStrategy[],
 ) {
   if (ctx.withoutExpressFlag) {
@@ -166,10 +156,7 @@ export function addAuthStrategies(
   ctx.authStrategies.push(...strategies);
 }
 
-export function setAuthResolver(
-  ctx: ServiceConfigContext,
-  resolver: AuthResolver,
-) {
+export function setAuthResolver(ctx: ServiceState, resolver: AuthResolver) {
   if (ctx.withoutExpressFlag) {
     ctx.log.warn(
       "Express server is disabled. Auth resolver will not be applied.",
@@ -179,12 +166,12 @@ export function setAuthResolver(
   ctx.authResolverOverride = resolver;
 }
 
-export function disableDefaultHeaderAuthFallback(ctx: ServiceConfigContext) {
+export function disableDefaultHeaderAuthFallback(ctx: ServiceState) {
   ctx.useDefaultHeaderAuthFallback = false;
 }
 
 export function addRouterRegistration(
-  ctx: ServiceConfigContext,
+  ctx: ServiceState,
   base: string,
   router: Router,
   routes: RouteDefinition<any, any, boolean>[] = [],

@@ -318,4 +318,21 @@ describe("Mongo abstraction advanced behaviors", () => {
 
     await mismatched.disconnect();
   });
+
+  it("throws from read methods when the database is unavailable", async () => {
+    const mongo = createMongo(
+      "read_errors_db",
+      {
+        users: defineMongoCollection({
+          schema: z.object({ name: z.string() }),
+        }),
+      },
+      { uri: mongoServer.getUri() },
+    );
+    await mongo.connect();
+    await mongo.disconnect();
+
+    await expect(mongo.users.get()).rejects.toThrow();
+    await expect(mongo.users.getOne()).rejects.toThrow();
+  });
 });

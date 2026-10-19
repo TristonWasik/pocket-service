@@ -21,7 +21,7 @@ describe("MongoDB Dependency", () => {
   beforeAll(async () => {
     mongoServer = await MongoMemoryServer.create();
     const uri = mongoServer.getUri();
-    service = new Service()
+    service = await new Service()
       .withName("admin-service")
       .withPort(4120)
       .withRedis("redis://localhost:6379")
@@ -44,6 +44,7 @@ describe("MongoDB Dependency", () => {
   });
 
   afterAll(async () => {
+    await service.shutdown();
     await mongoServer.stop();
   });
 
@@ -91,8 +92,8 @@ describe("MongoDB Dependency", () => {
   });
 
   it("Should support creating and using time-series collections", async () => {
-    const tsService = new Service()
-      .withName("admin-service")
+    const tsService = await new Service()
+      .withName("timeseries-service")
       .withPort(4121)
       .withRedis("redis://localhost:6379")
       .withMongo({
@@ -115,8 +116,6 @@ describe("MongoDB Dependency", () => {
       })
       .build();
 
-    await tsService.mongo.connect();
-
     const collectionInfo = await tsService.mongo.db
       .listCollections({ name: "metrics" }, { nameOnly: false })
       .next();
@@ -136,6 +135,6 @@ describe("MongoDB Dependency", () => {
     expect(values.length).toBe(1);
     expect(values[0].value).toBe(42);
 
-    await tsService.mongo.disconnect();
+    await tsService.shutdown();
   });
 });

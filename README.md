@@ -22,63 +22,99 @@ import { Service } from "@twasik4/pocket-service";
 
 Deep imports into `src/*` or `dist/*` are not part of the public API surface.
 
-## Contributor layout
-
-Current source layout:
-
-1. `src/core` for `Service` orchestration and core helpers
-2. `src/api` for Express route metadata/types helpers
-3. `src/auth` for auth strategies
-4. `src/modules` for Mongo/ClickHouse adapters
-5. `src/runtime` for worker runtime and stream handling
-
 ## Service Class API
 
 Use this as the quick reference, then jump to examples.
 
-### Lifecycle and runtime
+### Lifecycle
 
-1. `build()` -> [Example: Basic Service](#example-basic-service)
-2. `register()` -> [Modules](#modules)
-3. `heartbeat()` -> [Modules](#modules)
-4. `shutdown(opts?)` -> [Modules](#modules)
+| Method | Description |
+| ------ | ----------- |
+| `await build()` | Connects every module, starts workers and the HTTP server, and resolves when the service is ready. Rejects (after cleaning up) if anything fails. See [Lifecycle and shutdown](#lifecycle-and-shutdown). |
+| `await shutdown(opts?)` | Graceful shutdown. Doesn't exit the process. |
+| `register()` / `heartbeat()` | Service registry in Redis. `build()` starts both automatically. |
 
 ### Builder methods (chainable)
 
-1. `withName(name)` -> [Configurations](#configurations)
-2. `withPort(port?)` -> [Configurations](#configurations)
-3. `withUrl(url)` -> [Configurations](#configurations)
-4. `withRedis(url?)` -> [Modules](#modules)
-5. `withMongo(config)` -> [Mongo Collection Helpers](#mongo-collection-helpers)
-6. `withClickhouse(config)` -> [Modules](#modules)
-7. `withWorkers(workerCount, serviceStreams?, options?)` -> [Example: withWorkers](#example-withworkers)
-8. `withModules(customModules)` -> [Modules](#modules)
-9. `withExpressOptions(options)` -> [Example: withExpressOptions](#example-withexpressoptions)
-10. `withAuthStrategy(strategy)` -> [Example: withAuthStrategies (JWT + mTLS)](#example-withauthstrategies-jwt--mtls)
-11. `withAuthStrategies(strategies)` -> [Example: withAuthStrategies (JWT + mTLS)](#example-withauthstrategies-jwt--mtls)
-12. `withAuthResolver(resolver)` -> [Example: withAuthResolver](#example-withauthresolver)
-13. `withoutDefaultHeaderAuthFallback()` -> [Example: withAuthStrategies (JWT + mTLS)](#example-withauthstrategies-jwt--mtls)
-14. `withoutExpress()` -> [Configurations](#configurations)
-15. `addRouter(base, router, routes?)` -> [Example: addRouter + createMetaRouter](#example-addrouter--createmetarouter)
+| Method | Description |
+| ------ | ----------- |
+| `withName(name)` | Service name for logs and the registry ([Configurations](#configurations)) |
+| `withPort(port?)` | HTTP port ([Configurations](#configurations)) |
+| `withUrl(url)` | Base URL advertised in the registry ([Configurations](#configurations)) |
+| `withRedis(url?)` | Redis client and service registration ([Modules](#modules)) |
+| `withMongo(config)` | Typed Mongo collections ([Mongo Collection Helpers](#mongo-collection-helpers)) |
+| `withClickhouse(config)` | Typed ClickHouse tables ([Example: withClickhouse](#example-withclickhouse)) |
+| `withWorkers(count, streams?, options?)` | Redis stream workers ([Example: withWorkers](#example-withworkers)) |
+| `withModules(modules)` | Custom startup and shutdown hooks ([Modules](#modules)) |
+| `withExpressOptions(options)` | JSON parsing, CORS, middleware ([Example: withExpressOptions](#example-withexpressoptions)) |
+| `withAuthStrategy(strategy)` / `withAuthStrategies(strategies)` | JWT, mTLS or custom auth ([Example](#example-withauthstrategies-jwt--mtls)) |
+| `withAuthResolver(resolver)` | Fully custom auth ([Example: withAuthResolver](#example-withauthresolver)) |
+| `withoutDefaultHeaderAuthFallback()` | Disable `x-user-id` header auth |
+| `withoutExpress()` | No HTTP server (worker-only or module-only services) |
+| `withSignalHandlers(enabled?, options?)` | SIGINT/SIGTERM handling ([Lifecycle and shutdown](#lifecycle-and-shutdown)) |
+| `addRouter(base, router, routes?)` | Register a router ([Example: addRouter + createMetaRouter](#example-addrouter--createmetarouter)) |
 
 ### Public getters
 
-1. `streamKey`
-2. `simpleName`
-3. `fullUrl`
-4. `status`
-5. `routes`
-6. `api`
-7. `log`
-8. `redis`
-9. `mongo`
-10. `db`
-11. `clickhouse`
+`streamKey`, `simpleName`, `fullUrl`, `status`, `routes`, `api`, `log`, `redis`, `mongo`, `db`, `clickhouse`
 
-### Advanced public symbols
+### Symbols
 
-1. `[Symbol.dispose]()`
-2. `[Symbol.iterator]()`
+- `[Symbol.asyncDispose]()` runs `shutdown()`, so `await using service = await new Service().build()` works.
+- `[Symbol.iterator]()` yields the configured dependencies.
+
+## Lifecycle and shutdown
+
+`build()` is async. It resolves once the service is ready to serve traffic:
+
+1. Configures Express middleware, CORS, the default routes and your routers.
+2. Connects Redis, MongoDB and ClickHouse concurrently.
+3. Runs custom module `init` hooks in order.
+4. Starts workers, registers the service in Redis and starts the heartbeat.
+5. Starts the HTTP server.
+
+If any step fails, for example because Mongo is unreachable or the port is in use, everything that already started is shut down and `build()` rejects. Calling `build()` twice returns the same promise.
+
+```ts
+const service = await new Service()
+  .withName("billing")
+  .withRedis()
+  .build();
+```
+
+`shutdown()` stops accepting HTTP requests, waits for in-flight requests and worker messages, removes the registry entry, runs custom `shutdown` hooks in reverse order, then closes ClickHouse, MongoDB and Redis. It **doesn't exit the process**, and calling it again returns the same promise.
+
+By default, the service handles `SIGINT` and `SIGTERM` by running `shutdown()` and then exiting. If shutdown takes longer than `shutdownTimeoutMs` (default 15s), the process is forced to exit. A second `Ctrl+C` exits immediately.
+
+```ts
+// Change the timeout
+new Service().withSignalHandlers(true, { shutdownTimeoutMs: 30_000 });
+
+// Handle signals yourself
+const service = await new Service().withSignalHandlers(false).build();
+process.on("SIGTERM", async () => {
+  await service.shutdown();
+  process.exit(0);
+});
+```
+
+In tests or scripts, `await using` shuts the service down when it goes out of scope:
+
+```ts
+await using service = await new Service().withPort(0).build();
+```
+
+## Environment variables
+
+| Variable | Used for | Default |
+| -------- | -------- | ------- |
+| `SERVICE_NAME` | `withName()` | random hex string |
+| `SERVICE_URL` | `withUrl()` | `http://localhost` |
+| `SERVICE_PORT`, then `PORT` | `withPort()` | `3100` |
+| `REDIS_URL` | `withRedis()` | `redis://redis:6379` |
+| `MONGO_URI` | `withMongo()` when no `uri` is given | `mongodb://mongo:27017` |
+
+Explicit builder arguments always win over environment variables.
 
 ## Examples
 
@@ -87,7 +123,7 @@ Use the Service class to streamline setup and reduce boilerplate.
 ### Example: Basic Service
 
 ```ts
-const service = new Service().build();
+const service = await new Service().build();
 ```
 
 This includes an Express server with a few [built-in endpoints](#built-in-endpoints), plus a built-in Winston logger.
@@ -120,12 +156,12 @@ A full Redis instance with built-in service registration.
 
 3. withClickhouse()
 
-Typed wrapper for table `select` and `insert`, plus custom methods with strongly typed inputs.
+Typed wrapper for table `select` and `insert`, plus custom methods with strongly typed inputs. `select()` only accepts columns from the table's `schema()`, and sends filter values as query parameters.
 
 ### Example: withClickhouse
 
 ```ts
-const service = new Service()
+const service = await new Service()
   .withClickhouse({
     url: "http://localhost:8123",
     username: "default",
@@ -159,7 +195,7 @@ await service.clickhouse.events.insert([
 const rows = await service.clickhouse.events.select({ type: "user.created" });
 ```
 
-You can also define custom methods with named inputs (`:inputName`) and strong typing:
+You can also define custom methods with strongly typed inputs. Use ClickHouse query parameters (`{name:Type}`); inputs are sent to the server as parameters and never interpolated into the SQL:
 
 ```ts
 import { Service, defineClickhouseMethod } from "@twasik4/pocket-service";
@@ -176,7 +212,7 @@ const service = new Service().withClickhouse({
           { type: string },
           Array<{ id: string; type: string; createdAt: string }>
         >({
-          sql: "SELECT id, type, createdAt FROM events WHERE type = :type",
+          sql: "SELECT id, type, createdAt FROM events WHERE type = {type:String}",
         }),
       }),
     },
@@ -197,7 +233,7 @@ Consumes Redis streams in worker threads through a consumer group, with retries,
 `withWorkers` only initializes workers when at least one stream is passed in `serviceStreams`, and at least one handler file is found.
 
 ```ts
-const service = new Service()
+const service = await new Service()
   .withName("billing")
   .withRedis("redis://localhost:6379")
   .withWorkers(2, ["auth:events", "billing:events"], {
@@ -251,9 +287,7 @@ Additional routes added to Express (all require auth). `:stream` must be one of 
 
 5. withModules(customModules: CustomModules)
 
-Use this to register custom modules.
-
-You can also add optional `shutdown` hooks:
+Use this to register custom modules. Each `init` runs during `build()`, after Redis, Mongo and ClickHouse connect, in the order given. If `init` throws or returns `false`, `build()` rejects. Optional `shutdown` hooks run in reverse order during `shutdown()`:
 
 ```ts
 const service = new Service().withModules([
@@ -278,7 +312,7 @@ const service = new Service().withModules([
 Sets the service name, used primarily for service registration via Redis. Defaults to a random hex string.
 
 ```ts
-const service = new Service().withName("Service Name").build();
+const service = await new Service().withName("Service Name").build();
 ```
 
 2. withPort()
@@ -286,7 +320,7 @@ const service = new Service().withName("Service Name").build();
 Sets the port of the Express server. Defaults to 3100.
 
 ```ts
-const service = new Service().withPort(8111).build();
+const service = await new Service().withPort(8111).build();
 ```
 
 Setting the port as above makes Express listen on that port. Your root endpoint at http://localhost:8111/ returns:
@@ -300,7 +334,7 @@ OK from "Service Name" service
 Sets the base URL of the service. Useful for service registration via Redis.
 
 ```ts
-const service = new Service().withUrl("https://my-domain.com").build();
+const service = await new Service().withUrl("https://my-domain.com").build();
 ```
 
 4. withExpressOptions()
@@ -310,7 +344,7 @@ Manually configures Express options like CORS and custom middleware.
 ### Example: withExpressOptions
 
 ```ts
-const service = new Service()
+const service = await new Service()
   .withExpressOptions({
     asJson: true,
     corsWhitelist: ["http://localhost:5173"],
@@ -321,10 +355,12 @@ const service = new Service()
 
 The snippet above parses incoming bodies with the Express JSON parser, enforces CORS, whitelists localhost on 5173, and passes credentials.
 
+By default, `corsWhitelist` is `["*"]`, which allows requests from any origin. Combining `"*"` with `credentials: true` fails the build, because browsers reject that combination; list explicit origins instead.
+
 You can also use `corsFn` instead of `corsWhitelist`, and `omitDefaultRoutes` if you do not want `/` and `/health`.
 
 ```ts
-const service = new Service()
+const service = await new Service()
   .withExpressOptions({
     asJson: true,
     omitDefaultRoutes: true,
@@ -423,7 +459,7 @@ addRoute(
     method: "POST",
     requireAuth: false,
     meta: {
-      description: "Register endpoint",
+      description: "Refresh token endpoint",
     },
   },
   async (req, res) => {
@@ -480,7 +516,7 @@ const jwtStrategy = createJwtAuthStrategy({
   }),
 });
 
-const service = new Service()
+const service = await new Service()
   .withAuthStrategies([mtlsStrategy, jwtStrategy])
   .withoutDefaultHeaderAuthFallback()
   .build();
@@ -504,7 +540,7 @@ const jwtStrategy = createJwtAuthStrategy({
   }),
 });
 
-const service = new Service()
+const service = await new Service()
   .withAuthStrategy(jwtStrategy)
   .withoutDefaultHeaderAuthFallback()
   .build();
@@ -547,7 +583,7 @@ Use this when you want a fully custom auth resolver at the service level. This o
 ### Example: withAuthResolver
 
 ```ts
-const service = new Service()
+const service = await new Service()
   .withAuthResolver(async (req, route) => {
     // fully custom auth
     return { userId: "internal-user" };
@@ -675,3 +711,26 @@ await service.redis.xAdd("auth:events", "*", {
   userId: "u_123",
 });
 ```
+
+## Migrating from 1.x
+
+- **`build()` is async.** Change `new Service()...build()` to `await new Service()...build()`. It now rejects if a module fails to start; previously, errors were only logged.
+- **`shutdown()` no longer calls `process.exit()`.** The built-in SIGINT/SIGTERM handlers still exit after shutting down. If you called `shutdown()` yourself and relied on it exiting, call `process.exit()` afterwards.
+- **Custom modules:** `init` is awaited, and throwing or returning `false` fails `build()`. `shutdown` hooks run in reverse order.
+- **`[Symbol.dispose]` was replaced by `[Symbol.asyncDispose]`.** Use `await using`.
+- **ClickHouse custom methods use `{name:Type}` parameters instead of `:name`.** For example, `WHERE type = :type` becomes `WHERE type = {type:String}`. `select()` throws for columns that aren't in the table's `schema()`.
+- **Mongo read methods throw on database errors.** `get`, `getOne`, `getRevisions` and `getMostRecentRevision` used to return `[]` or `null`.
+- **CORS:** the default `corsWhitelist: ["*"]` now actually allows any origin. Combining `"*"` with `credentials: true` is rejected.
+- **Workers:** the consumer group is now `<service name>:consumer-group`, and events use an `eventType` field. See [withWorkers](#example-withworkers).
+- **Ports:** `SERVICE_PORT` now takes precedence over `PORT` everywhere.
+- **Removed:** `getRegisteredRoutes()`, the `Message` type, and `RouteMeta.authRequired` (use `requireAuth`).
+
+## Contributor layout
+
+Current source layout:
+
+1. `src/core` for `Service` orchestration and core helpers
+2. `src/api` for Express route metadata/types helpers
+3. `src/auth` for auth strategies
+4. `src/modules` for Mongo/ClickHouse adapters
+5. `src/runtime` for worker runtime and stream handling

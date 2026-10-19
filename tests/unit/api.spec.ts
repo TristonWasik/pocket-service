@@ -1,13 +1,17 @@
 /// <reference types="vitest/globals" />
+import { createServer } from "http";
+import express from "express";
 import {
   registerDefaultRoutes,
+  resolveCorsOptions,
   setupExpressApp,
+  startHttpServer,
+  closeHttpServer,
   type ServiceApiRuntimeContext,
 } from "../../src/core/service/api";
 
 function makeContext(): ServiceApiRuntimeContext {
   const use = vi.fn();
-  const listen = vi.fn((_: number, cb: () => void) => cb());
 
   return {
     withoutExpressFlag: false,
@@ -18,11 +22,8 @@ function makeContext(): ServiceApiRuntimeContext {
     },
     api: {
       use,
-      listen,
     } as any,
     routers: [],
-    fullUrl: "http://localhost:3100",
-    port: 3100,
     log: {
       info: vi.fn(),
       warn: vi.fn(),
@@ -81,10 +82,10 @@ describe("service/api helpers", () => {
     expect(ctx.log.warn).toHaveBeenCalledWith(
       "Express server is disabled. Service built without Express.",
     );
-    expect((ctx.api.listen as any).mock.calls.length).toBe(0);
+    expect((ctx.api.use as any).mock.calls.length).toBe(0);
   });
 
-  it("respects omitDefaultRoutes and still starts the API", () => {
+  it("respects omitDefaultRoutes", () => {
     const ctx = makeContext();
     ctx.expressOptions = {
       asJson: false,
@@ -96,7 +97,6 @@ describe("service/api helpers", () => {
     setupExpressApp(ctx);
 
     expect(ctx.internalAddRouter).not.toHaveBeenCalled();
-    expect((ctx.api.listen as any).mock.calls.length).toBe(1);
   });
 
   it("registers default routes when omitDefaultRoutes is false", () => {
@@ -105,6 +105,51 @@ describe("service/api helpers", () => {
     setupExpressApp(ctx);
 
     expect(ctx.internalAddRouter).toHaveBeenCalled();
-    expect((ctx.api.listen as any).mock.calls.length).toBe(1);
+  });
+
+  it("allows any origin for a '*' whitelist", () => {
+    expect(
+      resolveCorsOptions({ asJson: true, corsWhitelist: ["*"] }),
+    ).toEqual({ origin: "*" });
+  });
+
+  it("rejects a '*' whitelist combined with credentials", () => {
+    expect(() =>
+      resolveCorsOptions({
+        asJson: true,
+        corsWhitelist: ["*"],
+        credentials: true,
+      }),
+    ).toThrow("cannot be combined with credentials");
+  });
+
+  it("passes explicit origins and credentials through", () => {
+    expect(
+      resolveCorsOptions({
+        asJson: true,
+        corsWhitelist: ["http://a.test"],
+        credentials: true,
+      }),
+    ).toEqual({ origin: ["http://a.test"], credentials: true });
+  });
+
+  it("rejects when the port is already in use and frees it on close", async () => {
+    const log = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+    const blocker = createServer();
+    await new Promise<void>((resolve) => blocker.listen(0, resolve));
+    const port = (blocker.address() as { port: number }).port;
+
+    await expect(
+      startHttpServer({ api: express(), port, fullUrl: "", log }),
+    ).rejects.toThrow("EADDRINUSE");
+
+    await closeHttpServer(blocker);
+    const server = await startHttpServer({
+      api: express(),
+      port,
+      fullUrl: "",
+      log,
+    });
+    await closeHttpServer(server);
   });
 });

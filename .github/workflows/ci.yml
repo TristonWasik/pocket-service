@@ -45,6 +45,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Typecheck
+        run: pnpm typecheck
+
       # Worker thread tests run against the built package.
       - name: Build
         run: pnpm build
@@ -53,4 +56,4 @@ jobs:
         env:
           MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
           REDIS_URL: redis://localhost:6379
-        run: pnpm test -- --run
+        run: pnpm test

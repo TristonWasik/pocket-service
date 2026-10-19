@@ -1,20 +1,15 @@
+import { createServer, Server } from "http";
 import express, { Express, Request, Response, Router } from "express";
-import cors from "cors";
+import cors, { CorsOptions } from "cors";
 import {
   AuthResolver,
   createMetaRouter,
   RouteDefinition,
 } from "../../api/express-types";
 import { dlqStream, groupName } from "../../runtime/stream-names";
-import { ExpressOptions, CustomModules } from "../types";
+import { ExpressOptions, CustomModules, Log, ServiceStatus } from "../types";
 import { getUseableDatesFromMs } from "../utils";
 import type { WorkerState } from "./workers";
-
-type Log = {
-  info: (message: string) => void;
-  warn: (message: string) => void;
-  error: (message: string) => void;
-};
 
 type RouteRecord = {
   base: string;
@@ -25,7 +20,7 @@ type RouteRecord = {
 type ServiceApiBaseContext = {
   log: Log;
   name: string;
-  getStatus: () => "starting" | "running" | "stopped" | "stopping";
+  getStatus: () => ServiceStatus;
   startedAt: number;
   dependencies: Map<string, unknown>;
   getRoutes: () => {
@@ -59,8 +54,6 @@ export type ServiceApiRuntimeContext = ServiceApiBaseContext & {
   expressOptions: ExpressOptions;
   api: Express;
   routers: RouteRecord[];
-  fullUrl: string;
-  port: number;
 };
 
 export function registerDefaultRoutes(ctx: ServiceApiBaseContext) {
@@ -91,24 +84,14 @@ export function setupExpressApp(ctx: ServiceApiRuntimeContext) {
     ctx.api.use(mw);
   }
 
-  if ("corsWhitelist" in ctx.expressOptions) {
+  const corsOptions = resolveCorsOptions(ctx.expressOptions);
+  if (corsOptions) {
     ctx.log.info(
-      "Configuring CORS with whitelist: " + ctx.expressOptions.corsWhitelist,
+      "corsFn" in ctx.expressOptions
+        ? "Configuring CORS with function"
+        : `Configuring CORS with whitelist: ${ctx.expressOptions.corsWhitelist}`,
     );
-    ctx.api.use(
-      cors({
-        origin: ctx.expressOptions.corsWhitelist,
-        credentials: ctx.expressOptions.credentials,
-      }),
-    );
-  } else if ("corsFn" in ctx.expressOptions) {
-    ctx.log.info("Configuring CORS with function");
-    ctx.api.use(
-      cors({
-        origin: ctx.expressOptions.corsFn,
-        credentials: ctx.expressOptions.credentials,
-      }),
-    );
+    ctx.api.use(cors(corsOptions));
   }
 
   if (!ctx.expressOptions.omitDefaultRoutes) {
@@ -148,8 +131,61 @@ export function setupExpressApp(ctx: ServiceApiRuntimeContext) {
         .join("\n"),
   );
 
-  ctx.api.listen(ctx.port, () => {
-    ctx.log.info(`API listening at ${ctx.fullUrl}`);
+}
+
+/**
+ * Maps ExpressOptions to `cors` options. A whitelist containing `"*"` allows
+ * any origin, which browsers reject in combination with credentials.
+ */
+export function resolveCorsOptions(
+  options: ExpressOptions,
+): CorsOptions | null {
+  if ("corsFn" in options && options.corsFn) {
+    return { origin: options.corsFn, credentials: options.credentials };
+  }
+  if (!("corsWhitelist" in options) || !options.corsWhitelist) {
+    return null;
+  }
+  if (options.corsWhitelist.includes("*")) {
+    if (options.credentials) {
+      throw new Error(
+        'CORS: corsWhitelist "*" cannot be combined with credentials: true. List explicit origins instead.',
+      );
+    }
+    return { origin: "*" };
+  }
+  return { origin: options.corsWhitelist, credentials: options.credentials };
+}
+
+/**
+ * Starts listening and resolves once the port is bound. Rejects on listen
+ * errors such as EADDRINUSE.
+ */
+export function startHttpServer(ctx: {
+  api: Express;
+  port: number;
+  fullUrl: string;
+  log: Log;
+}): Promise<Server> {
+  return new Promise((resolve, reject) => {
+    const server = createServer(ctx.api);
+    server.once("error", reject);
+    server.listen(ctx.port, () => {
+      server.off("error", reject);
+      ctx.log.info(`API listening at ${ctx.fullUrl}`);
+      resolve(server);
+    });
+  });
+}
+
+/**
+ * Stops accepting connections, closes idle keep-alive sockets, and resolves
+ * once in-flight requests have finished.
+ */
+export function closeHttpServer(server: Server): Promise<void> {
+  return new Promise((resolve, reject) => {
+    server.close((err) => (err ? reject(err) : resolve()));
+    server.closeIdleConnections();
   });
 }
 

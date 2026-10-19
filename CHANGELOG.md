@@ -1,5 +1,44 @@
 # Changelog
 
+## 2.0.0 - 2026-10-19
+
+### Breaking
+
+- `build()` is async and resolves when the service is ready. It rejects, after shutting down whatever already started, if any module, custom `init` hook, or the HTTP listener fails.
+- `shutdown()` no longer calls `process.exit()`. The built-in SIGINT/SIGTERM handlers exit after shutdown completes.
+- Custom module `init` hooks are awaited in order, and returning `false` or throwing fails `build()`. `shutdown` hooks run in reverse order.
+- `[Symbol.dispose]` was replaced by `[Symbol.asyncDispose]`, which supports `await using`.
+- ClickHouse custom methods use native `{name:Type}` query parameters instead of `:name` placeholders.
+- ClickHouse `select()` only accepts columns declared in the table's `schema()`.
+- Mongo `get`, `getOne`, `getRevisions` and `getMostRecentRevision` throw on database errors instead of returning `[]` or `null`.
+- Combining `corsWhitelist: ["*"]` with `credentials: true` is rejected.
+- `SERVICE_PORT` takes precedence over `PORT` in both the default port and `withPort()`.
+- Removed `getRegisteredRoutes()`, the `Message` type, and `RouteMeta.authRequired`.
+- The package only exposes `exports`. `main` and `types` were removed.
+
+### Added
+
+- `withSignalHandlers(enabled, { shutdownTimeoutMs })` to configure or disable SIGINT/SIGTERM handling. SIGTERM is now handled, not just SIGINT.
+- `withRedis()` defaults to the `REDIS_URL` environment variable.
+- `pnpm typecheck` script, and a typecheck step in CI.
+
+### Fixed
+
+- Modules were logged as "initialized successfully" before they connected, and under the wrong names. `build()` also reported `running` immediately.
+- `shutdown()` now closes the HTTP server, stops the heartbeat, and removes the service's registry key.
+- Shutdown continues past a failing step instead of leaving later dependencies open.
+- ClickHouse `select()` interpolated raw filter values into SQL, and custom methods used escaping that missed backslashes. Both now use server-side query parameters.
+- The default CORS config (`["*"]`) matched no real origin, so no CORS headers were sent.
+- The registry entry listed no dependencies, because the code called `Object.keys` on a Map.
+- `[Symbol.iterator]` yielded nothing.
+- Heartbeat failures caused unhandled promise rejections.
+
+### Changed
+
+- `Service` keeps its configuration in a single state object, replacing the config sync layer.
+- ClickHouse uses the `url` client option instead of the deprecated `host`.
+- Removed the unused `winston-transport` dependency.
+
 ## 1.2 - 2026-10-18
 
 ### Fixed

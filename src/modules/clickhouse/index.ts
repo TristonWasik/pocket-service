@@ -9,7 +9,9 @@ export type ClickhouseMethodDefinition<
   TResult = any[],
 > = {
   /**
-   * SQL statement using named input placeholders like `:userId`.
+   * SQL statement using ClickHouse query parameters, e.g.
+   * `SELECT * FROM events WHERE type = {type:String}`. Each input field is
+   * sent as a server-side parameter, never interpolated into the SQL.
    */
   sql: string;
   /**
@@ -75,45 +77,88 @@ export function defineClickhouseMethod<
   return config;
 }
 
-function escapeSqlValue(value: unknown): string {
-  if (value === null || value === undefined) {
-    return "NULL";
-  }
+const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
-  if (Array.isArray(value)) {
-    return `[${value.map((v) => escapeSqlValue(v)).join(", ")}]`;
-  }
-
-  if (value instanceof Date) {
-    return `'${value.toISOString().replace(/'/g, "''")}'`;
-  }
-
-  if (typeof value === "number" || typeof value === "bigint") {
-    return `${value}`;
-  }
-
-  if (typeof value === "boolean") {
-    return value ? "1" : "0";
-  }
-
-  return `'${String(value).replace(/'/g, "''")}'`;
+/**
+ * Backtick-quotes a (possibly database-qualified) identifier, rejecting
+ * anything that is not a plain identifier.
+ */
+function quoteIdentifier(name: string): string {
+  return name
+    .split(".")
+    .map((part) => {
+      if (!IDENTIFIER.test(part)) {
+        throw new Error(`Invalid ClickHouse identifier: ${name}`);
+      }
+      return `\`${part}\``;
+    })
+    .join(".");
 }
 
-function bindNamedParams(sql: string, input?: Record<string, unknown>): string {
-  const params = input || {};
-  return sql.replace(/:([a-zA-Z_][a-zA-Z0-9_]*)/g, (_, key: string) => {
-    if (!(key in params)) {
-      throw new Error(`Missing ClickHouse method input parameter: ${key}`);
+/**
+ * Infers the ClickHouse type used for a `select()` filter parameter.
+ */
+function paramType(value: unknown): string {
+  if (typeof value === "string") return "String";
+  if (typeof value === "bigint") return "Int64";
+  if (typeof value === "number") {
+    return Number.isInteger(value) ? "Int64" : "Float64";
+  }
+  if (typeof value === "boolean") return "Bool";
+  if (value instanceof Date) return "DateTime64(3)";
+  if (Array.isArray(value)) {
+    return `Array(${value.length > 0 ? paramType(value[0]) : "String"})`;
+  }
+  throw new Error(`Unsupported ClickHouse filter value: ${String(value)}`);
+}
+
+const PLACEHOLDER = /\{([A-Za-z_][A-Za-z0-9_]*):/g;
+
+/**
+ * Names of the `{name:Type}` parameters referenced by a SQL statement.
+ */
+export function queryParamNames(sql: string): string[] {
+  return [...new Set([...sql.matchAll(PLACEHOLDER)].map((m) => m[1]))];
+}
+
+/**
+ * Builds a parameterized WHERE clause. Column names must exist in the table
+ * schema; values are sent as query parameters.
+ */
+export function buildWhereClause(
+  where: Record<string, unknown> | undefined,
+  columns: Set<string>,
+): { clause: string; params: Record<string, unknown> } {
+  const conditions: string[] = [];
+  const params: Record<string, unknown> = {};
+
+  for (const [column, value] of Object.entries(where ?? {})) {
+    if (!columns.has(column)) {
+      throw new Error(`Unknown ClickHouse column: ${column}`);
     }
-    return escapeSqlValue(params[key]);
-  });
+    if (value === undefined) continue;
+
+    const id = quoteIdentifier(column);
+    if (value === null) {
+      conditions.push(`${id} IS NULL`);
+      continue;
+    }
+    const name = `p${conditions.length}`;
+    params[name] = value;
+    conditions.push(`${id} = {${name}:${paramType(value)}}`);
+  }
+
+  return {
+    clause: conditions.length > 0 ? ` WHERE ${conditions.join(" AND ")}` : "",
+    params,
+  };
 }
 
 export function createTypedClickhouse<
   TTables extends Record<string, ClickhouseTable<any, ClickhouseTableMethods>>,
 >(config: ClickhouseConfig<TTables>) {
   const client = createClient({
-    host: config.url,
+    url: config.url,
     username: config.username,
     password: config.password,
   });
@@ -129,19 +174,13 @@ export function createTypedClickhouse<
       type Row = ReturnType<typeof table.schema>;
       type Filter = Partial<Row>;
 
+      const columns = new Set(Object.keys(table.schema()));
+
       const select = async (where?: Filter): Promise<Row[]> => {
-        let query = `SELECT * FROM ${table.name}`;
-        if (where && Object.keys(where).length > 0) {
-          const conditions = Object.entries(where)
-            .map(([k, value]) => {
-              if (typeof value === "string") return `${k} = '${value}'`;
-              return `${k} = ${value}`;
-            })
-            .join(" AND ");
-          query += ` WHERE ${conditions}`;
-        }
+        const { clause, params } = buildWhereClause(where, columns);
         const res = await client.query({
-          query,
+          query: `SELECT * FROM ${quoteIdentifier(table.name)}${clause}`,
+          query_params: params,
         });
         const rows = await res.json<{ data: any[] }>();
         return rows.data as Row[];
@@ -164,17 +203,26 @@ export function createTypedClickhouse<
 
       const customMethods = Object.fromEntries(
         Object.entries(customMethodDefinitions).map(([methodName, def]) => {
+          const paramNames = queryParamNames(def.sql);
           const method = async (input?: Record<string, unknown>) => {
-            const query = bindNamedParams(def.sql, input);
+            const query = def.sql;
+            const query_params = input ?? {};
+            for (const name of paramNames) {
+              if (!(name in query_params)) {
+                throw new Error(
+                  `Missing ClickHouse method input parameter: ${name}`,
+                );
+              }
+            }
 
             if (def.mode === "command") {
-              const result = await client.command({ query });
+              const result = await client.command({ query, query_params });
               return def.transform
                 ? def.transform(result, input as any)
                 : (undefined as any);
             }
 
-            const result = await client.query({ query });
+            const result = await client.query({ query, query_params });
             const parsed = await result.json<{ data: any[] }>();
 
             return def.transform

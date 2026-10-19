@@ -5,13 +5,12 @@ import {
   Response,
   Router,
 } from "express";
-import z, { ZodSchema, output } from "zod";
+import z, { output, ZodType } from "zod";
 
 export type RouteMeta = {
   description?: string;
   deprecated?: boolean;
   tags?: string[];
-  authRequired?: boolean;
   rateLimit?: "standard" | "strict" | "none";
   version?: string;
   [key: string]: any;
@@ -95,9 +94,9 @@ export type TypedRequest<
   TParams = unknown,
   TRequireAuth extends boolean = false,
 > = Request<
-  TParams extends ZodSchema ? output<TParams> : Record<string, string>,
+  TParams extends ZodType ? output<TParams> : Record<string, string>,
   any,
-  TBody extends ZodSchema ? output<TBody> : any
+  TBody extends ZodType ? output<TBody> : any
 > &
   (TRequireAuth extends true
     ? { user: AuthenticatedUser }
@@ -117,8 +116,8 @@ export type TypedRequestHandler<
  * Defines a route with enhanced type safety and built-in support for request validation and authentication. This type is used in conjunction with the `addRoute` function to register routes on an Express router, allowing you to specify the HTTP method, path, authentication requirements, and Zod schemas for validating request bodies and URL parameters. The route definition also includes optional metadata that can be used for documentation or analytics purposes.
  */
 export type RouteDefinition<
-  TBody extends ZodSchema | undefined = undefined,
-  TParams extends ZodSchema | undefined = undefined,
+  TBody extends ZodType | undefined = undefined,
+  TParams extends ZodType | undefined = undefined,
   TRequireAuth extends boolean = false,
 > = {
   method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
@@ -137,12 +136,6 @@ export type RouteDefinition<
    */
   meta?: RouteMeta;
 };
-
-const registeredRoutes: RouteDefinition<any, any, boolean>[] = [];
-
-export function getRegisteredRoutes() {
-  return registeredRoutes;
-}
 
 type CreateMetaRouterOptions = {
   authResolver?: AuthResolver;
@@ -198,8 +191,8 @@ export function createMetaRouter(options?: CreateMetaRouterOptions): {
    * );
    */
   addRoute: <
-    TBody extends ZodSchema | undefined = undefined,
-    TParams extends ZodSchema | undefined = undefined,
+    TBody extends ZodType | undefined = undefined,
+    TParams extends ZodType | undefined = undefined,
     TRequireAuth extends boolean = false,
   >(
     route: RouteDefinition<TBody, TParams, TRequireAuth>,
@@ -265,8 +258,8 @@ export function createMetaRouter(options?: CreateMetaRouterOptions): {
    * );
    */
   function addRoute<
-    TBody extends ZodSchema | undefined = undefined,
-    TParams extends ZodSchema | undefined = undefined,
+    TBody extends ZodType | undefined = undefined,
+    TParams extends ZodType | undefined = undefined,
     TRequireAuth extends boolean = false,
   >(
     route: RouteDefinition<TBody, TParams, TRequireAuth>,

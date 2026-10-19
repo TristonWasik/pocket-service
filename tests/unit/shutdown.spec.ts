@@ -4,97 +4,75 @@ import {
   type ServiceShutdownContext,
 } from "../../src/core/service/shutdown";
 
-function makeContext(): ServiceShutdownContext {
+function makeContext(events: string[] = []): ServiceShutdownContext {
+  const record = (name: string) => vi.fn(async () => void events.push(name));
   return {
     dependencies: new Map<string, unknown>(),
-    stopWorkers: vi.fn(async () => undefined),
-    quitRedis: vi.fn(async () => true),
-    disconnectMongo: vi.fn(async () => true),
-    closeClickhouse: vi.fn(async () => true),
-    log: {
-      info: vi.fn(),
-      error: vi.fn(),
-    },
+    log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
     name: "admin-service",
-    setStatus: vi.fn(),
+    setStatus: vi.fn((status: string) => void events.push(`status:${status}`)),
+    closeHttp: record("http"),
+    stopWorkers: record("workers"),
+    stopHeartbeat: record("registry"),
+    closeRedis: record("redis"),
+    disconnectMongo: record("mongo"),
+    closeClickhouse: record("clickhouse"),
   };
 }
 
 describe("service/shutdown helper", () => {
-  it("runs shutdown sequence in order and exits", async () => {
-    const ctx = makeContext();
+  it("stops everything in reverse startup order without exiting", async () => {
+    const events: string[] = [];
+    const ctx = makeContext(events);
     ctx.dependencies.set("redis", true);
     ctx.dependencies.set("mongoClient", true);
     ctx.dependencies.set("clickhouse", true);
     ctx.dependencies.set("customDependencies", [
-      {
-        name: "custom-a",
-        init: vi.fn(),
-        shutdown: vi.fn(async () => true),
-      },
+      { name: "a", init: vi.fn(), shutdown: async () => (events.push("custom:a"), true) },
+      { name: "b", init: vi.fn(), shutdown: async () => (events.push("custom:b"), true) },
     ]);
+    const exitSpy = vi.spyOn(process, "exit");
 
-    const events: string[] = [];
-    (ctx.setStatus as any).mockImplementation((status: string) => {
-      events.push(`status:${status}`);
+    await shutdownService(ctx, {
+      beforeShutdown: async () => void events.push("before"),
+      afterShutdown: async () => void events.push("after"),
     });
-    (ctx.stopWorkers as any).mockImplementation(async () => {
-      events.push("workers");
-    });
-    (ctx.quitRedis as any).mockImplementation(async () => {
-      events.push("redis");
-    });
-    (ctx.disconnectMongo as any).mockImplementation(async () => {
-      events.push("mongo");
-    });
-    (ctx.closeClickhouse as any).mockImplementation(async () => {
-      events.push("clickhouse");
-    });
-    (ctx.dependencies.get("customDependencies") as any[])[0].shutdown = vi.fn(
-      async () => {
-        events.push("custom-a");
-        return true;
-      },
-    );
-
-    const beforeShutdown = vi.fn(async () => {
-      events.push("before");
-    });
-    const afterShutdown = vi.fn(async () => {
-      events.push("after");
-    });
-
-    const exitSpy = vi.spyOn(process, "exit").mockImplementation(((
-      code?: number,
-    ) => {
-      events.push(`exit:${code ?? 0}`);
-      return undefined as never;
-    }) as unknown as (code?: string | number | null | undefined) => never);
-
-    await shutdownService(ctx, { beforeShutdown, afterShutdown });
 
     expect(events).toEqual([
       "before",
       "status:stopping",
+      "http",
       "workers",
-      "redis",
-      "mongo",
+      "registry",
+      "custom:b",
+      "custom:a",
       "clickhouse",
-      "custom-a",
+      "mongo",
+      "redis",
       "status:stopped",
       "after",
-      "exit:0",
     ]);
-
-    expect(ctx.log.info).toHaveBeenCalledWith(
-      "Service admin-service shutting down.",
-    );
-
+    expect(exitSpy).not.toHaveBeenCalled();
     exitSpy.mockRestore();
   });
 
-  it("logs custom shutdown failures and continues", async () => {
+  it("skips modules that were not configured", async () => {
     const ctx = makeContext();
+
+    await shutdownService(ctx);
+
+    expect(ctx.closeRedis).not.toHaveBeenCalled();
+    expect(ctx.disconnectMongo).not.toHaveBeenCalled();
+    expect(ctx.closeClickhouse).not.toHaveBeenCalled();
+    expect(ctx.closeHttp).toHaveBeenCalled();
+  });
+
+  it("logs failing steps and keeps going", async () => {
+    const ctx = makeContext();
+    ctx.dependencies.set("redis", true);
+    ctx.closeHttp = vi.fn(async () => {
+      throw new Error("server stuck");
+    });
     ctx.dependencies.set("customDependencies", [
       {
         name: "bad-shutdown",
@@ -103,34 +81,21 @@ describe("service/shutdown helper", () => {
           throw new Error("failed");
         }),
       },
-      {
-        name: "good-shutdown",
-        init: vi.fn(),
-        shutdown: vi.fn(async () => true),
-      },
+      { name: "good-shutdown", init: vi.fn(), shutdown: vi.fn(async () => true) },
     ]);
-
-    const exitSpy = vi
-      .spyOn(process, "exit")
-      .mockImplementation(
-        (() => undefined as never) as unknown as (
-          code?: string | number | null | undefined,
-        ) => never,
-      );
 
     await shutdownService(ctx);
 
     expect(ctx.log.error).toHaveBeenCalledWith(
-      expect.stringContaining(
-        'Failed to shutdown custom dependency "bad-shutdown"',
-      ),
+      expect.stringContaining('Shutdown step "http" failed'),
+    );
+    expect(ctx.log.error).toHaveBeenCalledWith(
+      expect.stringContaining('Shutdown step "custom:bad-shutdown" failed'),
     );
     expect(ctx.log.info).toHaveBeenCalledWith(
-      expect.stringContaining(
-        'Custom dependency "good-shutdown" shutdown with result: true',
-      ),
+      'Custom dependency "good-shutdown" shutdown with result: true',
     );
-
-    exitSpy.mockRestore();
+    expect(ctx.closeRedis).toHaveBeenCalled();
+    expect(ctx.setStatus).toHaveBeenLastCalledWith("stopped");
   });
 });

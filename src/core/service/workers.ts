@@ -7,12 +7,8 @@ import type {
   WorkerThreadData,
   WorkerThreadMessage,
 } from "../../runtime/worker-thread";
+import type { Log } from "../types";
 
-type Log = {
-  info: (message: string) => void;
-  warn: (message: string) => void;
-  error: (message: string) => void;
-};
 
 export type WorkerOptions = ConsumerOptions & {
   /**

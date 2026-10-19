@@ -28,10 +28,10 @@ import {
   addRouterRegistration,
   addWorkerDependency,
   setExpressOptions,
-  type ServiceConfigContext,
+  type ServiceState,
 } from "../../src/core/service/config";
 
-function makeContext(): ServiceConfigContext {
+function makeContext(): ServiceState {
   return {
     dependencies: new Map<string, unknown>(),
     dependencyOrder: [],
