@@ -15,12 +15,27 @@
 - `SERVICE_PORT` takes precedence over `PORT` in both the default port and `withPort()`.
 - Removed `getRegisteredRoutes()`, the `Message` type, and `RouteMeta.authRequired`.
 - The package only exposes `exports`. `main` and `types` were removed.
+- Validation failures return the Zod issues in `details` instead of `error`. Every error response uses the `{ isSuccess: false, message, code?, details?, requestId }` envelope.
+- Unknown routes return a JSON `404`, and unhandled errors return a JSON `500` with a generic message, instead of Express's HTML pages.
+- `/workers` error responses use the standard error envelope.
+- `Service` has a second type parameter, `TEnv`, for `withEnv()`.
 
 ### Added
 
 - `withSignalHandlers(enabled, { shutdownTimeoutMs })` to configure or disable SIGINT/SIGTERM handling. SIGTERM is now handled, not just SIGINT.
 - `withRedis()` defaults to the `REDIS_URL` environment variable.
 - `pnpm typecheck` script, and a typecheck step in CI.
+- `HttpError`, plus error middleware that turns thrown errors into JSON responses and logs unexpected ones.
+- Request IDs: the `x-request-id` header is reused or generated, echoed back, and available as `req.id`, with a tagged `req.log` logger.
+- `queryValidator` on routes, which validates and types `req.query`.
+- `GET /health/live` and `GET /health/ready` probes. Readiness pings Redis, MongoDB, ClickHouse, and an optional `ready()` hook on custom modules.
+- `withEnv(schema)` for a validated, typed `service.env`.
+- Typed events: `defineEvent()`, `service.publish()`, typed `redisStreamHandler(event, ...)` overloads, and `ctx.publish()` in handlers. Invalid payloads are dead-lettered without retries.
+- `withOpenApi()` serves an OpenAPI 3.1 document generated from route definitions and Zod validators.
+- `withRateLimits()`: Redis-backed fixed-window limits per `meta.rateLimit` tier, with `RateLimit-*` and `Retry-After` headers. Falls back to per-process limits without Redis, and allows requests through if Redis fails.
+- `ExpressOptions.trustProxy`.
+- `Deprecation` header for routes with `meta.deprecated`, which now also accepts a `Date`.
+- `service.discovery` with `list()`, `get()` and `fetch()` over the Redis service registry, forwarding auth and the request ID.
 
 ### Fixed
 
@@ -32,6 +47,7 @@
 - The registry entry listed no dependencies, because the code called `Object.keys` on a Map.
 - `[Symbol.iterator]` yielded nothing.
 - Heartbeat failures caused unhandled promise rejections.
+- `/health` listed internal entries (`logger`, `expressApp`) as loaded modules.
 
 ### Changed
 

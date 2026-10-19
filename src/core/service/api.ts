@@ -1,20 +1,34 @@
 import { createServer, Server } from "http";
 import express, { Express, Request, Response, Router } from "express";
 import cors, { CorsOptions } from "cors";
+import type { Logger } from "winston";
+import {
+  createErrorHandler,
+  HttpError,
+  notFoundHandler,
+} from "../../api/errors";
+import { requestContext } from "../../api/request-context";
+import { buildOpenApiDocument, OpenApiOptions } from "../../api/openapi";
+import { RATE_LIMITER_KEY, RateLimiter } from "../../api/rate-limit";
 import {
   AuthResolver,
   createMetaRouter,
-  RouteDefinition,
+  AnyRouteDefinition,
 } from "../../api/express-types";
 import { dlqStream, groupName } from "../../runtime/stream-names";
 import { ExpressOptions, CustomModules, Log, ServiceStatus } from "../types";
 import { getUseableDatesFromMs } from "../utils";
 import type { WorkerState } from "./workers";
+import { INTERNAL_DEPENDENCIES } from "./config";
+
+const READINESS_TIMEOUT_MS = 2_000;
+
+export type ReadinessCheck = () => Promise<unknown>;
 
 type RouteRecord = {
   base: string;
   router: Router;
-  routes?: RouteDefinition<any, any, boolean>[];
+  routes?: AnyRouteDefinition[];
 };
 
 type ServiceApiBaseContext = {
@@ -25,9 +39,9 @@ type ServiceApiBaseContext = {
   dependencies: Map<string, unknown>;
   getRoutes: () => {
     path: string;
-    method: RouteDefinition<any, any, boolean>["method"];
+    method: AnyRouteDefinition["method"];
     requireAuth: boolean;
-    meta: RouteDefinition<any, any, boolean>["meta"];
+    meta: AnyRouteDefinition["meta"];
   }[];
   getLoadedEventListeners: () => string[];
   getIsWorkerRunning: () => boolean;
@@ -42,18 +56,22 @@ type ServiceApiBaseContext = {
     xPending: (...args: any[]) => Promise<any>;
   };
   getAuthResolver: () => AuthResolver;
+  getReadinessChecks: () => Record<string, ReadinessCheck>;
   internalAddRouter: (
     base: string,
     router: Router,
-    routes?: RouteDefinition<any, any, boolean>[],
+    routes?: AnyRouteDefinition[],
   ) => void;
 };
 
 export type ServiceApiRuntimeContext = ServiceApiBaseContext & {
+  logger: Logger;
   withoutExpressFlag: boolean;
   expressOptions: ExpressOptions;
   api: Express;
   routers: RouteRecord[];
+  openApi?: OpenApiOptions;
+  rateLimiter?: RateLimiter;
 };
 
 export function registerDefaultRoutes(ctx: ServiceApiBaseContext) {
@@ -73,6 +91,16 @@ export function setupExpressApp(ctx: ServiceApiRuntimeContext) {
     ctx.log.warn("Express server is disabled. Service built without Express.");
     return;
   }
+
+  if (ctx.expressOptions.trustProxy !== undefined) {
+    ctx.api.set("trust proxy", ctx.expressOptions.trustProxy);
+  }
+  if (ctx.rateLimiter) {
+    ctx.api.locals[RATE_LIMITER_KEY] = ctx.rateLimiter;
+  }
+
+  // First, so every later middleware and error response has a request ID.
+  ctx.api.use(requestContext(ctx.logger));
 
   if (ctx.expressOptions.asJson) {
     ctx.log.info("Configuring Express to parse JSON bodies");
@@ -96,6 +124,10 @@ export function setupExpressApp(ctx: ServiceApiRuntimeContext) {
 
   if (!ctx.expressOptions.omitDefaultRoutes) {
     registerDefaultRoutes(ctx);
+  }
+
+  if (ctx.openApi) {
+    registerOpenApiRoute(ctx, ctx.openApi);
   }
 
   ctx.log.info(`Registering ${ctx.routers.length} routers`);
@@ -131,6 +163,39 @@ export function setupExpressApp(ctx: ServiceApiRuntimeContext) {
         .join("\n"),
   );
 
+  ctx.api.use(notFoundHandler);
+  ctx.api.use(createErrorHandler(ctx.log));
+}
+
+/**
+ * Serves the OpenAPI document. It is built on the first request, once every
+ * router has been registered, and then cached.
+ */
+function registerOpenApiRoute(
+  ctx: ServiceApiRuntimeContext,
+  options: OpenApiOptions,
+) {
+  const path = options.path ?? "/openapi.json";
+  const { router, routes, addRoute } = createMetaRouter();
+  let document: ReturnType<typeof buildOpenApiDocument> | null = null;
+
+  addRoute(
+    {
+      method: "GET",
+      fullPath: path,
+      requireAuth: false,
+      meta: { description: "OpenAPI document for this service" },
+    },
+    (_, res) => {
+      document ??= buildOpenApiDocument(ctx.routers, {
+        ...options,
+        defaultTitle: ctx.name,
+      });
+      res.json(document);
+    },
+  );
+
+  ctx.internalAddRouter("/", router, routes);
 }
 
 /**
@@ -227,7 +292,7 @@ function initBaseRoutes(ctx: ServiceApiBaseContext) {
         uptime: getUseableDatesFromMs(Math.floor(process.uptime() * 1000)),
         workerRunning: ctx.getIsWorkerRunning(),
         modulesLoaded: Array.from(ctx.dependencies.keys())
-          .filter((f) => f !== "customDependencies")
+          .filter((key) => !INTERNAL_DEPENDENCIES.has(key))
           .concat(
             Array.from(
               ctx.dependencies.has("customDependencies")
@@ -243,7 +308,80 @@ function initBaseRoutes(ctx: ServiceApiBaseContext) {
     },
   );
 
+  addRoute(
+    {
+      method: "GET",
+      fullPath: "/health/live",
+      requireAuth: false,
+      meta: { description: "Liveness probe: 200 while the process is up" },
+    },
+    (_, res) => {
+      res.json({ status: "ok" });
+    },
+  );
+
+  addRoute(
+    {
+      method: "GET",
+      fullPath: "/health/ready",
+      requireAuth: false,
+      meta: {
+        description:
+          "Readiness probe: 200 when the service is running and every dependency responds, otherwise 503",
+      },
+    },
+    async (_, res) => {
+      const status = ctx.getStatus();
+      if (status !== "running") {
+        res.status(503).json({
+          status: "not_ready",
+          reason: `Service is ${status}`,
+          checks: {},
+        });
+        return;
+      }
+
+      const entries = Object.entries(ctx.getReadinessChecks());
+      const results = await Promise.all(
+        entries.map(([, check]) => runReadinessCheck(check)),
+      );
+      const checks = Object.fromEntries(
+        entries.map(([name], i) => [name, results[i]]),
+      );
+      const ready = results.every((result) => result === "ok");
+
+      res
+        .status(ready ? 200 : 503)
+        .json({ status: ready ? "ready" : "not_ready", checks });
+    },
+  );
+
   ctx.internalAddRouter("/", router, routes);
+}
+
+/**
+ * Runs one readiness check with a timeout, returning "ok" or the error
+ * message.
+ */
+async function runReadinessCheck(check: ReadinessCheck): Promise<string> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    await Promise.race([
+      check(),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () =>
+            reject(new Error(`Timed out after ${READINESS_TIMEOUT_MS}ms`)),
+          READINESS_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    return "ok";
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 const MAX_STREAM_PAGE = 100;
@@ -271,17 +409,9 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
     return async (req: Request, res: Response) => {
       const stream = String(req.params.stream);
       if (!ctx.workerSubscriptions.includes(stream)) {
-        res.status(404).json({ error: `Unknown stream: ${stream}` });
-        return;
+        throw new HttpError(404, `Unknown stream: ${stream}`);
       }
-      try {
-        await handler(stream, req, res);
-      } catch (err) {
-        ctx.log.error(`Worker route failed for ${stream}: ${err}`);
-        res.status(500).json({
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      await handler(stream, req, res);
     };
   }
 
@@ -386,7 +516,7 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
       const redis = ctx.getRedis();
       const [entry] = await redis.xRange(dlqStream(stream), id, id);
       if (!entry) {
-        return res.status(404).json({ error: "Message not found in DLQ" });
+        throw new HttpError(404, "Message not found in DLQ");
       }
       const fields = JSON.parse(entry.message.message) as Record<
         string,

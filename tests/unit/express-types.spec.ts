@@ -162,7 +162,8 @@ describe("express-types", () => {
       (l: any) => l.route?.path === "/secure-order",
     );
 
-    expect(layer.route.stack).toHaveLength(3);
+    // auth -> rate limit -> body validation -> handler
+    expect(layer.route.stack).toHaveLength(4);
 
     const authMiddleware = layer.route.stack[0].handle;
     const bodyMiddleware = layer.route.stack[1].handle;
@@ -268,7 +269,8 @@ describe("express-types", () => {
     const layer = (router as any).stack.find(
       (l: any) => l.route?.path === "/body",
     );
-    const bodyMiddleware = layer.route.stack[0].handle;
+    // The validator is the last middleware before the handler.
+    const bodyMiddleware = layer.route.stack.at(-2).handle;
 
     const req = { body: '{"count":1}' } as Request;
     const res = createMockResponse();
@@ -297,7 +299,8 @@ describe("express-types", () => {
     const layer = (router as any).stack.find(
       (l: any) => l.route?.path === "/invalid-body",
     );
-    const bodyMiddleware = layer.route.stack[0].handle;
+    // The validator is the last middleware before the handler.
+    const bodyMiddleware = layer.route.stack.at(-2).handle;
 
     const req = { body: "{bad" } as Request;
     const res = createMockResponse();
@@ -327,7 +330,8 @@ describe("express-types", () => {
     const layer = (router as any).stack.find(
       (l: any) => l.route?.path === "/items/:id",
     );
-    const paramsMiddleware = layer.route.stack[0].handle;
+    // The validator is the last middleware before the handler.
+    const paramsMiddleware = layer.route.stack.at(-2).handle;
 
     const req = { params: { id: "not-a-uuid" } } as unknown as Request;
     const res = createMockResponse();

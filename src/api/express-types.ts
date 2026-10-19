@@ -5,12 +5,22 @@ import {
   Response,
   Router,
 } from "express";
-import z, { output, ZodType } from "zod";
+import type { output, ZodType } from "zod";
+import { errorBody } from "./errors";
+import { rateLimitMiddleware } from "./rate-limit";
 
 export type RouteMeta = {
   description?: string;
-  deprecated?: boolean;
+  /**
+   * Marks the route deprecated in OpenAPI and sends a `Deprecation` header:
+   * `true`, or `@<unix seconds>` when a Date (the deprecation date) is given.
+   */
+  deprecated?: boolean | Date;
   tags?: string[];
+  /**
+   * Rate-limit tier from `withRateLimits()`. Routes without one use the
+   * configured default tier.
+   */
   rateLimit?: "standard" | "strict" | "none";
   version?: string;
   [key: string]: any;
@@ -23,14 +33,14 @@ export type AuthenticatedUser = {
 
 export type AuthResolver = (
   req: Request,
-  route: RouteDefinition<any, any, boolean>,
+  route: AnyRouteDefinition,
 ) => AuthenticatedUser | null | Promise<AuthenticatedUser | null>;
 
 export type AuthStrategy = {
   name: string;
   canHandle?: (
     req: Request,
-    route: RouteDefinition<any, any, boolean>,
+    route: AnyRouteDefinition,
   ) => boolean | Promise<boolean>;
   authenticate: AuthResolver;
 };
@@ -89,14 +99,18 @@ export function createAuthResolver(
   };
 }
 
+type Infer<T, TFallback> = T extends ZodType ? output<T> : TFallback;
+
 export type TypedRequest<
   TBody = unknown,
   TParams = unknown,
   TRequireAuth extends boolean = false,
+  TQuery = unknown,
 > = Request<
-  TParams extends ZodType ? output<TParams> : Record<string, string>,
+  Infer<TParams, Record<string, string>>,
   any,
-  TBody extends ZodType ? output<TBody> : any
+  Infer<TBody, any>,
+  Infer<TQuery, Request["query"]>
 > &
   (TRequireAuth extends true
     ? { user: AuthenticatedUser }
@@ -106,36 +120,47 @@ export type TypedRequestHandler<
   TBody = unknown,
   TParams = unknown,
   TRequireAuth extends boolean = false,
+  TQuery = unknown,
 > = (
-  req: TypedRequest<TBody, TParams, TRequireAuth>,
+  req: TypedRequest<TBody, TParams, TRequireAuth, TQuery>,
   res: Response,
   next: NextFunction,
 ) => unknown;
 
 /**
- * Defines a route with enhanced type safety and built-in support for request validation and authentication. This type is used in conjunction with the `addRoute` function to register routes on an Express router, allowing you to specify the HTTP method, path, authentication requirements, and Zod schemas for validating request bodies and URL parameters. The route definition also includes optional metadata that can be used for documentation or analytics purposes.
+ * Defines a route with enhanced type safety and built-in support for request validation and authentication. This type is used in conjunction with the `addRoute` function to register routes on an Express router, allowing you to specify the HTTP method, path, authentication requirements, and Zod schemas for validating the request body, URL parameters and query string. The route definition also includes optional metadata used for documentation (OpenAPI), rate limiting and deprecation headers.
  */
 export type RouteDefinition<
   TBody extends ZodType | undefined = undefined,
   TParams extends ZodType | undefined = undefined,
   TRequireAuth extends boolean = false,
+  TQuery extends ZodType | undefined = undefined,
 > = {
   method: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
   fullPath: string;
   requireAuth?: TRequireAuth;
   /**
-   * Optional Zod schema to validate the request body. Only applicable for non-GET requests. If provided, the middleware will automatically validate the request body against this schema and return a 400 error if validation fails.
+   * Optional Zod schema to validate the request body. Only applicable for non-GET requests. Invalid bodies get a 400 response.
    */
   bodyValidator?: TBody;
   /**
-   * Optional Zod schema to validate URL parameters (e.g., :id in /users/:id). If provided, the middleware will automatically validate the URL parameters against this schema and return a 400 error if validation fails.
+   * Optional Zod schema to validate URL parameters (e.g., :id in /users/:id). Invalid parameters get a 400 response.
    */
   paramsValidator?: TParams;
   /**
-   * Optional metadata for the route, which can be used for documentation, analytics, or other purposes.
+   * Optional Zod schema to validate the query string. Query values arrive as strings (or arrays of strings), so use `z.coerce` for numbers and booleans. Invalid queries get a 400 response.
+   */
+  queryValidator?: TQuery;
+  /**
+   * Optional metadata for the route, used for documentation, rate limiting and deprecation headers.
    */
   meta?: RouteMeta;
 };
+
+/**
+ * A route definition with any validators, for collections of routes.
+ */
+export type AnyRouteDefinition = RouteDefinition<any, any, boolean, any>;
 
 type CreateMetaRouterOptions = {
   authResolver?: AuthResolver;
@@ -143,135 +168,139 @@ type CreateMetaRouterOptions = {
   onAuthError?: (err: unknown, req: Request, res: Response) => void;
 };
 
+type AddRoute = <
+  TBody extends ZodType | undefined = undefined,
+  TParams extends ZodType | undefined = undefined,
+  TRequireAuth extends boolean = false,
+  TQuery extends ZodType | undefined = undefined,
+>(
+  route: RouteDefinition<TBody, TParams, TRequireAuth, TQuery>,
+  /** Request handler for the route */ handler: TypedRequestHandler<
+    TBody,
+    TParams,
+    TRequireAuth,
+    TQuery
+  >,
+) => void;
+
 /**
- * Utility function to create an Express router with enhanced type safety and built-in support for request validation and authentication. This function allows you to define routes with associated Zod schemas for validating request bodies and URL parameters, as well as specifying whether authentication is required for each route. The returned object includes the configured Express router, a list of registered routes for introspection, and a helper function to add new routes with the specified configurations.
+ * Validates one part of the request and replaces it with the parsed value.
+ */
+function validate(
+  schema: ZodType,
+  read: (req: Request) => unknown,
+  write: (req: Request, value: unknown) => void,
+  message: string,
+): RequestHandler {
+  return (req, res, next) => {
+    const result = schema.safeParse(read(req));
+    if (!result.success) {
+      res
+        .status(400)
+        .json(errorBody(req, message, { details: result.error.issues }));
+      return;
+    }
+    write(req, result.data);
+    next();
+  };
+}
+
+/**
+ * Validates the body. Bodies sent without a JSON content type arrive as
+ * strings, so they are parsed first when the schema expects structured data
+ * or a number.
+ */
+function validateBody(schema: ZodType): RequestHandler {
+  const type = (schema as { def?: { type?: string } }).def?.type;
+  const validateParsed = validate(
+    schema,
+    (req) => req.body,
+    (req, value) => {
+      req.body = value;
+    },
+    "Invalid request body",
+  );
+
+  return (req, res, next) => {
+    if (typeof req.body === "string") {
+      if (type === "object" || type === "array") {
+        try {
+          req.body = JSON.parse(req.body);
+        } catch {
+          res.status(400).json(errorBody(req, "Invalid JSON in request body"));
+          return;
+        }
+      } else if (type === "number") {
+        const value = Number(req.body);
+        if (Number.isNaN(value)) {
+          res
+            .status(400)
+            .json(errorBody(req, "Invalid number in request body"));
+          return;
+        }
+        req.body = value;
+      }
+    }
+    validateParsed(req, res, next);
+  };
+}
+
+/**
+ * Creates an Express router whose routes carry metadata, Zod validation for the body, URL parameters and query string, and optional authentication.
+ *
+ * Route handlers may be async; thrown errors (including `HttpError`) are sent through the service's error middleware.
  */
 export function createMetaRouter(options?: CreateMetaRouterOptions): {
   /**
-   * The Express router instance that can be used to register routes and middleware. This router is configured to work with the enhanced route definitions provided by the `addRoute` function, which supports request validation and authentication requirements.
+   * The Express router to pass to `service.addRouter()`.
    */
   router: Router;
   /**
-   * List of registered routes with their configurations, which can be used for introspection, documentation generation, or analytics purposes. Each entry includes the HTTP method, full path, authentication requirement, validation schemas, and any additional metadata provided during route registration.
+   * Every route added so far, for introspection, OpenAPI generation and the service registry.
    */
-  routes: RouteDefinition<any, any, boolean>[];
+  routes: AnyRouteDefinition[];
   /**
-   * Adds a new route to the router with the specified configuration and request handler.
+   * Adds a route with the given definition and handler.
    *
-   * - If `requireAuth` is set to true, the route will automatically include middleware to check for an authenticated user and return a 401 error if the user is not authenticated.
-   * - If `bodyValidator` or `paramsValidator` are provided, the route will include middleware to validate the request body and URL parameters against the provided Zod schemas, returning a 400 error if validation fails.
-   *
-   * The route definition is also stored in an internal list for introspection purposes.
-   *
-   * @param route The route definition, including method, path, validation schemas, and authentication requirements.
-   * @param handler The request handler function for the route.
-   * @returns void
+   * - `requireAuth: true` resolves the user first and returns 401 when there is none; `req.user` is then typed as present.
+   * - `bodyValidator`, `paramsValidator` and `queryValidator` validate and replace `req.body`, `req.params` and `req.query`, returning 400 with `details` when validation fails.
    *
    * @example
    * addRoute(
    *   {
-   *     fullPath: "/me",
+   *     fullPath: "/users/:id",
    *     method: "GET",
    *     requireAuth: true,
-   *     meta: {
-   *       description: "Get current authenticated user info",
-   *     },
+   *     paramsValidator: z.object({ id: z.string() }),
+   *     meta: { description: "Get a user" },
    *   },
    *   async (req, res) => {
-   *     try {
-   *       ...fetch user info from database using req.user.userId...
-   *       res.status(200).json(...user info...);
-   *     } catch (err) {
-   *       console.error("Failed to fetch user info:", err);
-   *       res
-   *         .status(500)
-   *         .json({ isSuccess: false, message: "Internal server error" });
-   *     }
+   *     const user = await service.db.users.getOne({ id: req.params.id });
+   *     if (!user) throw new HttpError(404, "User not found");
+   *     res.json(user);
    *   },
    * );
    */
-  addRoute: <
-    TBody extends ZodType | undefined = undefined,
-    TParams extends ZodType | undefined = undefined,
-    TRequireAuth extends boolean = false,
-  >(
-    route: RouteDefinition<TBody, TParams, TRequireAuth>,
-    /** Request handler for the route */ handler: TypedRequestHandler<
-      TBody,
-      TParams,
-      TRequireAuth
-    >,
-  ) => void;
+  addRoute: AddRoute;
 } {
   const router = Router();
-  const routes: RouteDefinition<any, any, boolean>[] = [];
+  const routes: AnyRouteDefinition[] = [];
   const authResolver: AuthResolver =
     options?.authResolver ?? ((req) => defaultHeaderAuthResolver(req));
   const onUnauthorized =
     options?.onUnauthorized ??
-    ((_: Request, res: Response) => {
-      res.status(401).json({
-        isSuccess: false,
-        message: "Unauthorized",
-      });
+    ((req: Request, res: Response) => {
+      res.status(401).json(errorBody(req, "Unauthorized"));
     });
   const onAuthError =
     options?.onAuthError ??
-    ((_: unknown, __: Request, res: Response) => {
-      res.status(401).json({
-        isSuccess: false,
-        message: "Unauthorized",
-      });
+    ((_: unknown, req: Request, res: Response) => {
+      res.status(401).json(errorBody(req, "Unauthorized"));
     });
 
-  /**
-   * Adds a new route to the router with the specified configuration and request handler.
-   *
-   * - If `requireAuth` is set to true, the route will automatically include middleware to check for an authenticated user and return a 401 error if the user is not authenticated.
-   * - If `bodyValidator` or `paramsValidator` are provided, the route will include middleware to validate the request body and URL parameters against the provided Zod schemas, returning a 400 error if validation fails.
-   *
-   * The route definition is also stored in an internal list for introspection purposes.
-   * @param route The route definition, including method, path, validation schemas, and authentication requirements.
-   * @param handler The request handler function for the route.
-   *
-   * @example
-   * addRoute(
-   *   {
-   *     fullPath: "/me",
-   *     method: "GET",
-   *     requireAuth: true,
-   *     meta: {
-   *       description: "Get current authenticated user info",
-   *     },
-   *   },
-   *   async (req, res) => {
-   *     try {
-   *       ...fetch user info from database using req.user.userId...
-   *       res.status(200).json(...user info...);
-   *     } catch (err) {
-   *       console.error("Failed to fetch user info:", err);
-   *       res
-   *         .status(500)
-   *         .json({ isSuccess: false, message: "Internal server error" });
-   *     }
-   *   },
-   * );
-   */
-  function addRoute<
-    TBody extends ZodType | undefined = undefined,
-    TParams extends ZodType | undefined = undefined,
-    TRequireAuth extends boolean = false,
-  >(
-    route: RouteDefinition<TBody, TParams, TRequireAuth>,
-    /** Request handler for the route */ handler: TypedRequestHandler<
-      TBody,
-      TParams,
-      TRequireAuth
-    >,
-  ) {
+  const addRoute: AddRoute = (route, handler) => {
     const middlewareStack: RequestHandler[] = [];
-    const bodyValidator = route.bodyValidator;
-    const paramsValidator = route.paramsValidator;
+    const { bodyValidator, paramsValidator, queryValidator } = route;
 
     routes.push({
       method: route.method,
@@ -280,7 +309,21 @@ export function createMetaRouter(options?: CreateMetaRouterOptions): {
       meta: route.meta,
       bodyValidator,
       paramsValidator,
+      queryValidator,
     });
+
+    const deprecated = route.meta?.deprecated;
+    if (deprecated) {
+      const value =
+        deprecated instanceof Date
+          ? `@${Math.floor(deprecated.getTime() / 1000)}`
+          : "true";
+      middlewareStack.push((_req, res, next) => {
+        res.setHeader("Deprecation", value);
+        next();
+      });
+    }
+
     if (route.requireAuth) {
       middlewareStack.push(async (req, res, next) => {
         try {
@@ -291,81 +334,56 @@ export function createMetaRouter(options?: CreateMetaRouterOptions): {
             return;
           }
 
-          (req as TypedRequest<TBody, TParams, true>).user = user;
+          (req as TypedRequest<unknown, unknown, true>).user = user;
           next();
         } catch (err) {
           onAuthError(err, req, res);
         }
       });
     }
-    if (bodyValidator && route.method !== "GET") {
-      middlewareStack.push((req, res, next) => {
-        let value = req.body;
-        if (typeof value === "string") {
-          if (
-            bodyValidator instanceof z.ZodObject ||
-            bodyValidator instanceof z.ZodArray ||
-            bodyValidator.def.type === "object" ||
-            bodyValidator.def.type === "array"
-          ) {
-            try {
-              value = JSON.parse(value);
-            } catch (e) {
-              return res.status(400).json({
-                isSuccess: false,
-                message: "Invalid JSON in request body",
-                error: e instanceof Error ? e.message : e,
-              });
-            }
-          } else if (
-            bodyValidator instanceof z.ZodNumber ||
-            bodyValidator.def.type === "number"
-          ) {
-            try {
-              value = Number(value);
-            } catch (e) {
-              return res.status(400).json({
-                isSuccess: false,
-                message: "Invalid number in request body",
-                error: e instanceof Error ? e.message : e,
-              });
-            }
-          }
-        }
-        const validationResult = bodyValidator.safeParse(value);
-        if (validationResult.success) {
-          req.body = validationResult.data;
-          next();
-        } else {
-          res.status(400).json({
-            isSuccess: false,
-            message: "Invalid request body",
-            error: validationResult.error,
-          });
-        }
-      });
+    // After auth, so limits can be keyed by the authenticated user.
+    if (route.meta?.rateLimit !== "none") {
+      middlewareStack.push(rateLimitMiddleware(route));
     }
     if (paramsValidator) {
-      middlewareStack.push((req, res, next) => {
-        const validationResult = paramsValidator.safeParse(req.params);
-        if (validationResult.success) {
-          req.params = validationResult.data as Request["params"];
-          next();
-        } else {
-          res.status(400).json({
-            isSuccess: false,
-            message: "Invalid URL parameters",
-            error: validationResult.error,
-          });
-        }
-      });
+      middlewareStack.push(
+        validate(
+          paramsValidator,
+          (req) => req.params,
+          (req, value) => {
+            req.params = value as Request["params"];
+          },
+          "Invalid URL parameters",
+        ),
+      );
+    }
+    if (queryValidator) {
+      middlewareStack.push(
+        validate(
+          queryValidator,
+          (req) => req.query,
+          // Express 5 defines req.query as a getter without a setter.
+          (req, value) => {
+            Object.defineProperty(req, "query", {
+              value,
+              writable: true,
+              configurable: true,
+              enumerable: true,
+            });
+          },
+          "Invalid query parameters",
+        ),
+      );
+    }
+    if (bodyValidator && route.method !== "GET") {
+      middlewareStack.push(validateBody(bodyValidator));
     }
     (router as any)[route.method.toLowerCase()](
       route.fullPath,
       ...middlewareStack,
       handler as RequestHandler,
     );
-  }
+  };
 
   return {
     router,

@@ -26,6 +26,11 @@ export type BaseExpressOptions = {
    */
   customMiddleware?: ExpressMiddleware[];
   /**
+   * Express "trust proxy" setting. Set it when running behind a load balancer
+   * so `req.ip` (used for rate limiting) is the client's address.
+   */
+  trustProxy?: boolean | number | string | string[];
+  /**
    * Whether to allow CORS requests with credentials (cookies, authorization headers, etc.). This option is only relevant if CORS is enabled via either `corsFn` or `corsWhitelist`.
    */
   credentials?: boolean;
@@ -54,5 +59,10 @@ export type CustomModuleFactory = (log: Logger) => boolean | Promise<boolean>;
 export type CustomModules = {
   init: CustomModuleFactory;
   shutdown?: CustomModuleFactory;
+  /**
+   * Optional readiness check for `/health/ready`. Return `false` or throw
+   * when the module cannot serve traffic.
+   */
+  ready?: () => boolean | Promise<boolean>;
   name: string;
 }[];

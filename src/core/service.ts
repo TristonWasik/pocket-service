@@ -1,13 +1,14 @@
 import { Server } from "http";
 import express, { Express, Router } from "express";
 import { RedisClientType } from "redis";
+import z, { output, ZodType } from "zod";
 import { Logger } from "winston";
 import {
   AuthResolver,
   AuthStrategy,
   createAuthResolver,
   defaultHeaderAuthResolver,
-  RouteDefinition,
+  AnyRouteDefinition,
 } from "../api/express-types";
 import { ClickhouseConfig, createTypedClickhouse } from "../modules/clickhouse";
 import {
@@ -20,7 +21,13 @@ import { generateRandomHexString } from "./utils";
 import { CustomModules, ExpressOptions, ServiceStatus } from "./types";
 import { startService } from "./service/lifecycle";
 import {
+  encodeEvent,
+  EventDefinition,
+  EventInput,
+} from "../runtime/events";
+import {
   closeHttpServer,
+  ReadinessCheck,
   setupExpressApp,
   startHttpServer,
 } from "./service/api";
@@ -38,22 +45,33 @@ import {
   disableExpress,
   setAuthResolver,
   setExpressOptions,
+  INTERNAL_DEPENDENCIES,
   ServiceState,
 } from "./service/config";
 import { shutdownService, ShutdownOptions } from "./service/shutdown";
-import z from "zod/v3";
+import type { OpenApiOptions } from "../api/openapi";
+import {
+  createMemoryRateLimitStore,
+  createRateLimiter,
+  createRedisRateLimitStore,
+  RateLimiter,
+  RateLimitOptions,
+} from "../api/rate-limit";
+import { createDiscovery, Discovery, REGISTRY_PREFIX } from "./discovery";
 
 const DEFAULT_PORT = 3100;
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const REGISTRY_TTL_SECONDS = 30;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15_000;
-const INTERNAL_DEPENDENCIES = new Set(["logger", "expressApp"]);
 
 function envPort() {
   return Number(process.env.SERVICE_PORT ?? process.env.PORT) || DEFAULT_PORT;
 }
 
-export class Service<TCollections extends MongoCollectionsConfig = {}> {
+export class Service<
+  TCollections extends MongoCollectionsConfig = {},
+  TEnv = {},
+> {
   private name: string =
     process.env.SERVICE_NAME ?? generateRandomHexString(12);
   private url: string = process.env.SERVICE_URL ?? "http://localhost";
@@ -91,6 +109,8 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   private signalHandlersEnabled = true;
   private shutdownTimeoutMs = DEFAULT_SHUTDOWN_TIMEOUT_MS;
   private signalHandler: ((signal: NodeJS.Signals) => void) | null = null;
+  private envValues: { parsed: unknown } | null = null;
+  private discoveryClient: Discovery | null = null;
 
   private get dependencies() {
     return this.state.dependencies;
@@ -167,6 +187,16 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   }
 
   /**
+   * Environment values parsed by `withEnv()`.
+   */
+  get env(): TEnv {
+    if (!this.envValues) {
+      throw new Error("withEnv() has not been called.");
+    }
+    return this.envValues.parsed as TEnv;
+  }
+
+  /**
    * MongoDB client instance.
    *
    * @requires MongoDB module to be added via withMongo()
@@ -214,8 +244,103 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     return this.dependencies.get("redis") as RedisClientType;
   }
 
+  /**
+   * Validates and publishes a typed event defined with `defineEvent()`, and
+   * resolves with the new stream entry ID. Throws if the payload does not
+   * match the event's schema.
+   *
+   * @requires RedisModule to be added via withRedis()
+   * @param options.maxLen Approximately trim the stream to this many entries.
+   */
+  async publish<TEvent extends EventDefinition>(
+    event: TEvent,
+    data: EventInput<TEvent>,
+    options: { maxLen?: number } = {},
+  ): Promise<string> {
+    const { stream, fields } = encodeEvent(event, data);
+    return this.redis.xAdd(
+      stream,
+      "*",
+      fields,
+      options.maxLen === undefined
+        ? undefined
+        : {
+            TRIM: {
+              strategy: "MAXLEN",
+              strategyModifier: "~",
+              threshold: options.maxLen,
+            },
+          },
+    );
+  }
+
+  /**
+   * Dependency checks run by `GET /health/ready`.
+   */
+  private readinessChecks(): Record<string, ReadinessCheck> {
+    const checks: Record<string, ReadinessCheck> = {};
+    if (this.dependencies.has("redis")) {
+      checks.redis = () => this.redis.ping();
+    }
+    if (this.dependencies.has("mongoClient")) {
+      checks.mongo = () => this.mongo.db.command({ ping: 1 });
+    }
+    if (this.dependencies.has("clickhouse")) {
+      checks.clickhouse = async () => {
+        const result = await this.clickhouse.client.ping();
+        if (!result.success) throw result.error;
+      };
+    }
+    const customModules =
+      (this.dependencies.get("customDependencies") as
+        | CustomModules
+        | undefined) ?? [];
+    for (const module of customModules) {
+      if (!module.ready) continue;
+      checks[`custom:${module.name}`] = async () => {
+        if ((await module.ready!()) === false) {
+          throw new Error("Not ready");
+        }
+      };
+    }
+    return checks;
+  }
+
   private get registryKey() {
-    return `services:registry:${this.name}`;
+    return `${REGISTRY_PREFIX}${this.name}`;
+  }
+
+  /**
+   * Looks up and calls other services through the Redis service registry.
+   *
+   * @requires RedisModule to be added via withRedis()
+   */
+  get discovery(): Discovery {
+    this.discoveryClient ??= createDiscovery(
+      this.redis,
+      HEARTBEAT_INTERVAL_MS,
+    );
+    return this.discoveryClient;
+  }
+
+  private createRateLimiter(): RateLimiter | undefined {
+    const options = this.state.rateLimits;
+    if (!options) return undefined;
+
+    const hasRedis = this.dependencies.has("redis");
+    if (!hasRedis) {
+      this.log.warn(
+        "Rate limiting without Redis uses per-process counters; limits are not shared across instances.",
+      );
+    }
+    return createRateLimiter({
+      options,
+      store: hasRedis
+        ? createRedisRateLimitStore(this.redis)
+        : createMemoryRateLimitStore(),
+      prefix: `ratelimit:${this.name}`,
+      log: this.state.log,
+    });
   }
 
   /**
@@ -301,6 +426,8 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
       if (!this.state.withoutExpressFlag) {
         setupExpressApp({
           ...this.state,
+          rateLimiter: this.createRateLimiter(),
+          logger: this.log,
           api: this.api,
           name: this.name,
           getStatus: () => this.status,
@@ -312,6 +439,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
           workerSubscriptions: this.state.serviceStreamSubscriptions,
           getRedis: () => this.redis,
           getAuthResolver: () => this.getAuthResolver(),
+          getReadinessChecks: () => this.readinessChecks(),
           internalAddRouter: (base, router, routes) => {
             this.state.routers.push({ base, router, routes });
           },
@@ -409,7 +537,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     collections: TNextCollections;
   }) {
     addMongoDependency(this.state, config);
-    return this as unknown as Service<TNextCollections>;
+    return this as unknown as Service<TNextCollections, TEnv>;
   }
 
   /**
@@ -424,9 +552,38 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
     config: ClickhouseConfig<TTables>,
   ) {
     addClickhouseDependency(this.state, config);
-    return this as Service<TCollections> & {
+    return this as Service<TCollections, TEnv> & {
       clickhouse: ReturnType<typeof createTypedClickhouse<TTables>>;
     };
+  }
+
+  /**
+   * Validates environment variables with a Zod schema and exposes the typed
+   * result as `service.env`. Parsing happens immediately, so the values can be
+   * used by later builder calls; invalid values throw with a readable list of
+   * problems.
+   *
+   * @example
+   * const service = new Service().withEnv(
+   *   z.object({ REDIS_URL: z.url(), WORKERS: z.coerce.number().default(2) }),
+   * );
+   * service.withRedis(service.env.REDIS_URL);
+   *
+   * @param schema Zod schema for the environment.
+   * @param source Values to parse. Defaults to `process.env`.
+   */
+  withEnv<TSchema extends ZodType>(
+    schema: TSchema,
+    source: Record<string, string | undefined> = process.env,
+  ): Service<TCollections, output<TSchema>> {
+    const result = schema.safeParse(source);
+    if (!result.success) {
+      throw new Error(
+        `Invalid environment variables:\n${z.prettifyError(result.error)}`,
+      );
+    }
+    this.envValues = { parsed: result.data };
+    return this as unknown as Service<TCollections, output<TSchema>>;
   }
 
   /**
@@ -546,6 +703,33 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   }
 
   /**
+   * Enables rate limiting. Routes pick a tier with `meta.rateLimit`
+   * (`"standard"`, `"strict"` or `"none"`); routes without one use
+   * `options.default`, which is `"none"` unless set. Counters live in Redis
+   * when the service has it, so limits are shared across instances.
+   *
+   * @example
+   * new Service()
+   *   .withRedis()
+   *   .withRateLimits({ strict: { limit: 5, windowMs: 60_000 } });
+   */
+  withRateLimits(options: RateLimitOptions = {}) {
+    this.state.rateLimits = options;
+    return this;
+  }
+
+  /**
+   * Serves an OpenAPI 3.1 document (default path `/openapi.json`) generated
+   * from your routers' definitions and Zod validators.
+   *
+   * @param options Document path, info, servers and security schemes.
+   */
+  withOpenApi(options: OpenApiOptions = {}) {
+    this.state.openApi = options;
+    return this;
+  }
+
+  /**
    * Controls the built-in SIGINT/SIGTERM handling. When enabled (the default),
    * the first signal runs shutdown() and then exits the process, forcing an
    * exit if shutdown takes longer than `shutdownTimeoutMs`.
@@ -569,7 +753,7 @@ export class Service<TCollections extends MongoCollectionsConfig = {}> {
   addRouter(
     base: string,
     router: Router,
-    routes: RouteDefinition<any, any, boolean>[] = [],
+    routes: AnyRouteDefinition[] = [],
   ) {
     addRouterRegistration(this.state, base, router, routes);
     return this;

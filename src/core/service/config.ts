@@ -3,7 +3,7 @@ import { createClient } from "redis";
 import {
   AuthResolver,
   AuthStrategy,
-  RouteDefinition,
+  AnyRouteDefinition,
 } from "../../api/express-types";
 import {
   ClickhouseConfig,
@@ -11,12 +11,23 @@ import {
 } from "../../modules/clickhouse";
 import { createMongo, MongoCollectionsConfig } from "../../modules/mongo/mongo";
 import { CustomModules, ExpressOptions, Log } from "../types";
+import type { OpenApiOptions } from "../../api/openapi";
+import type { RateLimitOptions } from "../../api/rate-limit";
 import type { WorkerDependency, WorkerOptions } from "./workers";
+
+/**
+ * Dependency map entries that are runtime objects rather than modules.
+ */
+export const INTERNAL_DEPENDENCIES = new Set([
+  "logger",
+  "expressApp",
+  "customDependencies",
+]);
 
 export type RouterRegistration = {
   base: string;
   router: Router;
-  routes?: RouteDefinition<any, any, boolean>[];
+  routes?: AnyRouteDefinition[];
 };
 
 /**
@@ -35,6 +46,8 @@ export type ServiceState = {
   serviceStreamSubscriptions: string[];
   workerCount: number;
   routers: RouterRegistration[];
+  openApi?: OpenApiOptions;
+  rateLimits?: RateLimitOptions;
 };
 
 export function addMongoDependency<
@@ -110,6 +123,7 @@ export function addCustomModules(ctx: ServiceState, modules: CustomModules) {
         name: dep.name,
         init: dep.init,
         shutdown: dep.shutdown,
+        ready: dep.ready,
       })),
     );
     ctx.dependencyOrder.push("customDependencies");
@@ -174,7 +188,7 @@ export function addRouterRegistration(
   ctx: ServiceState,
   base: string,
   router: Router,
-  routes: RouteDefinition<any, any, boolean>[] = [],
+  routes: AnyRouteDefinition[] = [],
 ) {
   if (ctx.withoutExpressFlag) {
     ctx.log.warn("Express server is disabled. Routers will not be registered.");
