@@ -11,9 +11,11 @@ import {
 } from "../../modules/clickhouse";
 import { createMongo, MongoCollectionsConfig } from "../../modules/mongo/mongo";
 import { CustomModules, ExpressOptions } from "../types";
+import type { WorkerDependency, WorkerOptions } from "./workers";
 
 type Log = {
   warn: (message: string) => void;
+  error: (message: string) => void;
 };
 
 export type ServiceConfigContext = {
@@ -68,7 +70,13 @@ export function addRedisDependency(
   url: string = "redis://redis:6379",
 ) {
   if (!ctx.dependencies.has("redis")) {
-    ctx.dependencies.set("redis", createClient({ url }));
+    const client = createClient({ url });
+    // Without a listener, a dropped connection emits an unhandled 'error'
+    // event and crashes the process. node-redis reconnects on its own.
+    client.on("error", (err: Error) =>
+      ctx.log.error(`Redis error: ${err.message}`),
+    );
+    ctx.dependencies.set("redis", client);
     ctx.dependencyOrder.push("redis");
   }
 }
@@ -77,6 +85,7 @@ export function addWorkerDependency(
   ctx: ServiceConfigContext,
   workerCount: number,
   serviceStreams: string[] = [],
+  options: WorkerOptions = {},
 ) {
   if (!ctx.dependencies.has("redis")) {
     ctx.log.warn(
@@ -86,9 +95,13 @@ export function addWorkerDependency(
   }
 
   if (!ctx.dependencies.has("workers") && serviceStreams.length > 0) {
-    ctx.dependencies.set("workers", true);
     ctx.serviceStreamSubscriptions = serviceStreams;
     ctx.workerCount = workerCount < 1 ? 1 : workerCount;
+    ctx.dependencies.set("workers", {
+      workerCount: ctx.workerCount,
+      subscriptions: serviceStreams,
+      options,
+    } satisfies WorkerDependency);
     ctx.dependencyOrder.push("workers");
   }
 }

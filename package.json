@@ -49,7 +49,7 @@
     "test:unit": "vitest --run tests/unit",
     "test:integration": "vitest --run tests/integration",
     "test:watch": "vitest --watch",
-    "prepublishOnly": "pnpm test -- --run && pnpm build",
+    "prepublishOnly": "pnpm build && pnpm test -- --run",
     "pack:check": "npm pack --dry-run"
   },
   "peerDependencies": {

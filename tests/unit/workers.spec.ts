@@ -1,4 +1,5 @@
 /// <reference types="vitest/globals" />
+import { EventEmitter } from "events";
 
 const { existsSyncMock, readdirSyncMock, workerCtorMock } = vi.hoisted(() => ({
   existsSyncMock: vi.fn(),
@@ -16,125 +17,174 @@ vi.mock("worker_threads", () => ({
 }));
 
 import {
-  loadHandlers,
-  runWorkers,
+  discoverHandlers,
+  resolveHandlersDir,
+  startWorkers,
+  WorkerPool,
   type ServiceWorkerContext,
 } from "../../src/core/service/workers";
+
+class FakeWorker extends EventEmitter {
+  postMessage = vi.fn((msg: { type: string }) => {
+    if (msg.type === "stop") this.emit("exit", 0);
+  });
+  terminate = vi.fn(async () => 1);
+}
+
+function makeLog() {
+  return { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+}
 
 function makeContext(): ServiceWorkerContext {
   return {
     name: "admin-service",
-    dependencies: new Map<string, unknown>(),
-    log: {
-      info: vi.fn(),
-      warn: vi.fn(),
-      error: vi.fn(),
-    },
-    handlers: {},
-    redis: {
-      options: {
-        url: "redis://localhost:6379",
-      },
-    },
-    workerCount: 1,
-    serviceStreamSubscriptions: ["admin:events"],
-    isWorkerRunning: false,
-    loadedEventListeners: [],
+    dependencies: new Map<string, unknown>([
+      ["redis", true],
+      [
+        "workers",
+        { workerCount: 1, subscriptions: ["admin:events"], options: {} },
+      ],
+    ]),
+    log: makeLog(),
+    redisUrl: "redis://localhost:6379",
   };
+}
+
+function makePool(options = {}) {
+  return new WorkerPool({
+    name: "admin-service",
+    entry: new URL("file:///worker.mjs"),
+    handlers: { alpha: "/handlers/alpha.js" },
+    workerCount: 1,
+    subscriptions: ["admin:events"],
+    options,
+    log: makeLog(),
+  });
 }
 
 describe("service/workers helpers", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    workerCtorMock.mockImplementation(() => new FakeWorker());
   });
 
-  it("skips handler loading when redis dependency is missing", () => {
-    const ctx = makeContext();
-
-    loadHandlers(ctx);
-
-    expect(ctx.log.warn).toHaveBeenCalledWith(
-      "Redis module not initialized. Skipping handler loading.",
-    );
-  });
-
-  it("warns when handlers directory is missing", () => {
-    const ctx = makeContext();
-    ctx.dependencies.set("redis", true);
-    existsSyncMock.mockReturnValue(false);
-
-    loadHandlers(ctx);
-
-    expect(ctx.log.warn).toHaveBeenCalledWith(
-      "Handlers directory does not exist.",
-    );
-  });
-
-  it("loads only ts/js handlers", () => {
-    const ctx = makeContext();
-    ctx.dependencies.set("redis", true);
+  it("prefers an explicit handlers directory", () => {
     existsSyncMock.mockReturnValue(true);
-    readdirSyncMock.mockReturnValue(["alpha.ts", "beta.js", "notes.md"]);
+    expect(resolveHandlersDir("/app/dist/handlers")).toBe("/app/dist/handlers");
+  });
 
-    loadHandlers(ctx);
+  it("returns null when no handlers directory exists", () => {
+    existsSyncMock.mockReturnValue(false);
+    expect(resolveHandlersDir()).toBeNull();
+  });
 
-    expect(ctx.handlers).toHaveProperty("alpha");
-    expect(ctx.handlers).toHaveProperty("beta");
-    expect(ctx.handlers).not.toHaveProperty("notes");
+  it("discovers js/mjs/ts handler files and skips declarations", () => {
+    readdirSyncMock.mockReturnValue([
+      "alpha.ts",
+      "beta.js",
+      "gamma.mjs",
+      "types.d.ts",
+      "notes.md",
+    ]);
+
+    const handlers = discoverHandlers("/handlers");
+
+    expect(Object.keys(handlers).sort()).toEqual(["alpha", "beta", "gamma"]);
+  });
+
+  it("returns null without a workers dependency", () => {
+    const ctx = makeContext();
+    ctx.dependencies.delete("workers");
+    expect(startWorkers(ctx)).toBeNull();
   });
 
   it("throws for invalid worker count", () => {
     const ctx = makeContext();
-    ctx.dependencies.set("redis", true);
+    ctx.dependencies.set("workers", {
+      workerCount: 0,
+      subscriptions: ["admin:events"],
+      options: {},
+    });
 
-    expect(() => runWorkers(ctx, { workerCount: 0 })).toThrow(
-      "Worker count must be a number greater than 0.",
+    expect(() => startWorkers(ctx)).toThrow(
+      "Worker count must be an integer greater than 0.",
     );
   });
 
-  it("starts workers and maps worker messages to logger methods", () => {
+  it("does not start workers when no handlers are found", () => {
     const ctx = makeContext();
-    ctx.dependencies.set("redis", true);
     existsSyncMock.mockReturnValue(true);
+    readdirSyncMock.mockReturnValue([]);
 
-    const handlers: Record<string, (...args: any[]) => void> = {};
-    const workerInstance = {
-      on: vi.fn((event: string, cb: (...args: any[]) => void) => {
-        handlers[event] = cb;
-      }),
-    };
-
-    workerCtorMock.mockImplementation(() => workerInstance);
-
-    runWorkers(ctx, { workerCount: 1 });
-
-    expect(workerCtorMock).toHaveBeenCalledTimes(1);
-    expect(ctx.isWorkerRunning).toBe(true);
-
-    handlers.message?.({ level: "warn", message: "warn-msg" });
-    handlers.message?.({ level: "error", message: "error-msg" });
-    handlers.message?.({ level: "info", message: "info-msg" });
-    handlers.message?.({ level: "create", message: ["handler-a"] });
-
-    expect(ctx.log.warn).toHaveBeenCalledWith("warn-msg");
-    expect(ctx.log.error).toHaveBeenCalledWith("error-msg");
-    expect(ctx.log.info).toHaveBeenCalledWith("info-msg");
-    expect(ctx.loadedEventListeners).toEqual(["handler-a"]);
-
-    handlers.exit?.(0);
-    expect(ctx.isWorkerRunning).toBe(false);
-  });
-
-  it("skips worker startup when no worker entry file can be resolved", () => {
-    const ctx = makeContext();
-    ctx.dependencies.set("redis", true);
-    existsSyncMock.mockReturnValue(false);
-
-    runWorkers(ctx, { workerCount: 1 });
-
+    expect(startWorkers(ctx)).toBeNull();
     expect(workerCtorMock).not.toHaveBeenCalled();
     expect(ctx.log.warn).toHaveBeenCalledWith(
-      "Worker thread entry file not found. Skipping worker setup.",
+      expect.stringContaining("No handlers found"),
     );
+  });
+
+  it("reports state from worker messages", () => {
+    const pool = makePool();
+    pool.start();
+    const worker = workerCtorMock.mock.results[0].value as FakeWorker;
+
+    expect(pool.isRunning).toBe(false);
+    worker.emit("message", { level: "ready" });
+    worker.emit("message", { level: "create", message: ["user:created"] });
+
+    expect(pool.isRunning).toBe(true);
+    expect(pool.loadedHandlers).toEqual(["user:created"]);
+    expect(workerCtorMock.mock.calls[0][1].workerData).toMatchObject({
+      name: "admin-service",
+      index: 0,
+      subscriptions: ["admin:events"],
+    });
+  });
+
+  it("restarts a crashed worker and gives up after maxRestarts", () => {
+    vi.useFakeTimers();
+    const pool = makePool({ maxRestarts: 1 });
+    pool.start();
+
+    (workerCtorMock.mock.results[0].value as FakeWorker).emit("exit", 1);
+    expect(pool.status[0].state).toBe("restarting");
+
+    vi.advanceTimersByTime(1000);
+    expect(workerCtorMock).toHaveBeenCalledTimes(2);
+
+    (workerCtorMock.mock.results[1].value as FakeWorker).emit("exit", 1);
+    expect(pool.status[0]).toMatchObject({ state: "failed", restarts: 1 });
+    vi.useRealTimers();
+  });
+
+  it("stops workers by message and does not restart them", async () => {
+    const pool = makePool();
+    pool.start();
+    const worker = workerCtorMock.mock.results[0].value as FakeWorker;
+
+    await pool.stop();
+
+    expect(worker.postMessage).toHaveBeenCalledWith({ type: "stop" });
+    expect(worker.terminate).not.toHaveBeenCalled();
+    expect(pool.status[0].state).toBe("exited");
+  });
+
+  it("terminates workers that do not stop in time", async () => {
+    vi.useFakeTimers();
+    const pool = makePool({ shutdownTimeoutMs: 50 });
+    pool.start();
+    const worker = workerCtorMock.mock.results[0].value as FakeWorker;
+    worker.postMessage.mockImplementation(() => {});
+    worker.terminate.mockImplementation(async () => {
+      worker.emit("exit", 1);
+      return 1;
+    });
+
+    const stopped = pool.stop();
+    await vi.advanceTimersByTimeAsync(50);
+    await stopped;
+
+    expect(worker.terminate).toHaveBeenCalled();
+    vi.useRealTimers();
   });
 });

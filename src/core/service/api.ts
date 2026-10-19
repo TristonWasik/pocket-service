@@ -1,12 +1,14 @@
-import express, { Express, Router } from "express";
+import express, { Express, Request, Response, Router } from "express";
 import cors from "cors";
 import {
   AuthResolver,
   createMetaRouter,
   RouteDefinition,
 } from "../../api/express-types";
+import { dlqStream, groupName } from "../../runtime/stream-names";
 import { ExpressOptions, CustomModules } from "../types";
 import { getUseableDatesFromMs } from "../utils";
+import type { WorkerState } from "./workers";
 
 type Log = {
   info: (message: string) => void;
@@ -33,14 +35,16 @@ type ServiceApiBaseContext = {
     meta: RouteDefinition<any, any, boolean>["meta"];
   }[];
   getLoadedEventListeners: () => string[];
-  handlers: Record<string, string>;
   getIsWorkerRunning: () => boolean;
-  streamKey: string;
-  simpleName: string;
+  getWorkerStatus: () => WorkerState[];
+  workerSubscriptions: string[];
   getRedis: () => {
     xRange: (...args: any[]) => Promise<any>;
+    xRevRange: (...args: any[]) => Promise<any>;
     xAck: (...args: any[]) => Promise<any>;
     xAdd: (...args: any[]) => Promise<any>;
+    xDel: (...args: any[]) => Promise<any>;
+    xPending: (...args: any[]) => Promise<any>;
   };
   getAuthResolver: () => AuthResolver;
   internalAddRouter: (
@@ -206,10 +210,44 @@ function initBaseRoutes(ctx: ServiceApiBaseContext) {
   ctx.internalAddRouter("/", router, routes);
 }
 
+const MAX_STREAM_PAGE = 100;
+
+function parseCount(value: unknown) {
+  const count = Number(value ?? 10);
+  return Number.isInteger(count) && count > 0
+    ? Math.min(count, MAX_STREAM_PAGE)
+    : 10;
+}
+
 function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
   const { router, routes, addRoute } = createMetaRouter({
     authResolver: ctx.getAuthResolver(),
   });
+  const group = groupName(ctx.name);
+
+  /**
+   * Only streams this service subscribes to are exposed, so the routes cannot
+   * be used to read or modify arbitrary Redis keys.
+   */
+  function withStream(
+    handler: (stream: string, req: Request, res: Response) => Promise<unknown>,
+  ) {
+    return async (req: Request, res: Response) => {
+      const stream = String(req.params.stream);
+      if (!ctx.workerSubscriptions.includes(stream)) {
+        res.status(404).json({ error: `Unknown stream: ${stream}` });
+        return;
+      }
+      try {
+        await handler(stream, req, res);
+      } catch (err) {
+        ctx.log.error(`Worker route failed for ${stream}: ${err}`);
+        res.status(500).json({
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    };
+  }
 
   addRoute(
     {
@@ -223,7 +261,9 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
     (_, res) => {
       res.json({
         status: ctx.getIsWorkerRunning() ? "Running" : "Stopped",
-        handlersLoaded: Object.keys(ctx.handlers),
+        workers: ctx.getWorkerStatus(),
+        subscriptions: ctx.workerSubscriptions,
+        handlersLoaded: ctx.getLoadedEventListeners(),
       });
     },
   );
@@ -234,19 +274,30 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
       fullPath: "/:stream",
       requireAuth: true,
       meta: {
-        description: "Get stream messages",
+        description: "Get the most recent stream messages (?count, max 100)",
       },
     },
-    async (_, res) => {
-      const redis = ctx.getRedis();
-      if (!redis) {
-        return res.status(500).json({ error: "Redis client not connected" });
-      }
-      const messages = await redis.xRange(ctx.streamKey, "-", "+", {
-        COUNT: 10,
-      });
-      res.json({ status: "Stream", messages });
+    withStream(async (stream, req, res) => {
+      const messages = await ctx
+        .getRedis()
+        .xRevRange(stream, "+", "-", { COUNT: parseCount(req.query.count) });
+      res.json({ stream, messages });
+    }),
+  );
+
+  addRoute(
+    {
+      method: "GET",
+      fullPath: "/:stream/pending",
+      requireAuth: true,
+      meta: {
+        description: "Get the pending-entries summary for this service's group",
+      },
     },
+    withStream(async (stream, _, res) => {
+      const pending = await ctx.getRedis().xPending(stream, group);
+      res.json({ stream, group, pending });
+    }),
   );
 
   addRoute(
@@ -258,19 +309,12 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
         description: "Acknowledge a message in the stream",
       },
     },
-    async (req, res) => {
-      const { stream, id } = req.params;
-      const redis = ctx.getRedis();
-      if (!redis) {
-        return res.status(500).json({ error: "Redis client not connected" });
-      }
-      const result = await redis.xAck(
-        stream,
-        `${ctx.simpleName}:consumer-group`,
-        id,
-      );
+    withStream(async (stream, req, res) => {
+      const result = await ctx
+        .getRedis()
+        .xAck(stream, group, String(req.params.id));
       res.json({ status: "Message acknowledged", result });
-    },
+    }),
   );
 
   addRoute(
@@ -279,19 +323,17 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
       fullPath: "/:stream/dlq",
       requireAuth: true,
       meta: {
-        description: "Get DLQ stream messages",
+        description: "Get the most recent DLQ messages (?count, max 100)",
       },
     },
-    async (_, res) => {
-      const redis = ctx.getRedis();
-      if (!redis) {
-        return res.status(500).json({ error: "Redis client not connected" });
-      }
-      const messages = await redis.xRange(ctx.streamKey, "-", "+", {
-        COUNT: 10,
-      });
-      res.json({ status: "DLQ Stream", messages });
-    },
+    withStream(async (stream, req, res) => {
+      const messages = await ctx
+        .getRedis()
+        .xRevRange(dlqStream(stream), "+", "-", {
+          COUNT: parseCount(req.query.count),
+        });
+      res.json({ stream: dlqStream(stream), messages });
+    }),
   );
 
   addRoute(
@@ -300,26 +342,24 @@ function initWorkerRoutes(ctx: ServiceApiBaseContext): void {
       fullPath: "/:stream/dlq/:id/retry",
       requireAuth: true,
       meta: {
-        description: "Retry a message in the DLQ",
+        description: "Re-publish a DLQ message to its stream and remove it from the DLQ",
       },
     },
-    async (req, res) => {
-      const { stream, id } = req.params;
+    withStream(async (stream, req, res) => {
+      const id = String(req.params.id);
       const redis = ctx.getRedis();
-      if (!redis) {
-        return res.status(500).json({ error: "Redis client not connected" });
-      }
-      const dlqMessage = await redis.xRange(stream, id, id);
-      if (dlqMessage.length === 0 || dlqMessage[0].id !== id) {
+      const [entry] = await redis.xRange(dlqStream(stream), id, id);
+      if (!entry) {
         return res.status(404).json({ error: "Message not found in DLQ" });
       }
-      const result = await redis.xAdd(
-        stream,
-        `${ctx.simpleName}:consumer-group`,
-        dlqMessage[0].message,
-      );
-      res.json({ status: "Message retried", result });
-    },
+      const fields = JSON.parse(entry.message.message) as Record<
+        string,
+        string
+      >;
+      const newId = await redis.xAdd(stream, "*", fields);
+      await redis.xDel(dlqStream(stream), id);
+      res.json({ status: "Message retried", id: newId });
+    }),
   );
 
   ctx.internalAddRouter("/workers", router, routes);

@@ -10,8 +10,7 @@ export type ServiceLifecycleContext = {
   dependencyOrder: string[];
   dependencies: Map<string, unknown>;
   log: Log;
-  loadHandlers: () => void;
-  runWorkers: () => void;
+  startWorkers: () => void;
   connectRedis: () => Promise<unknown>;
   register: () => Promise<void>;
   heartbeat: () => Promise<void>;
@@ -28,8 +27,7 @@ export function initializeDependencies(ctx: ServiceLifecycleContext) {
         switch (key) {
           case "redis": {
             if (ctx.dependencies.has("workers")) {
-              ctx.loadHandlers();
-              ctx.runWorkers();
+              ctx.startWorkers();
             } else {
               ctx.log.warn(
                 "Worker module not initialized. Call withWorkers() to enable worker threads and dynamically load handlers.",

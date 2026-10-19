@@ -7,6 +7,7 @@ type Log = {
 
 export type ServiceShutdownContext = {
   dependencies: Map<string, unknown>;
+  stopWorkers: () => Promise<void>;
   quitRedis: () => Promise<unknown>;
   disconnectMongo: () => Promise<unknown>;
   closeClickhouse: () => Promise<unknown>;
@@ -25,6 +26,7 @@ export async function shutdownService(
   await opts.beforeShutdown?.();
   ctx.setStatus("stopping");
 
+  await ctx.stopWorkers();
   if (ctx.dependencies.has("redis")) {
     await ctx.quitRedis();
   }

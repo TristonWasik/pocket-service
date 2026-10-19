@@ -1,5 +1,33 @@
 # Changelog
 
+## 1.2 - 2026-10-18
+
+### Fixed
+
+- Worker threads now start when the package is installed from npm.
+- Workers no longer exit after processing their first message.
+- Messages are acknowledged on the stream they were read from.
+- `ctx.emit` is awaited and writes flat string fields with `eventType`, so other services can consume emitted events.
+- Dead-lettered messages are acknowledged, retries back off exponentially, and messages abandoned by crashed consumers are reclaimed with `XAUTOCLAIM`.
+- Redis errors in a worker are retried with backoff instead of killing the thread, and crashed workers are restarted.
+- `/workers` routes now use the `:stream` parameter, the real DLQ stream (`dlq:<stream>`) and the same consumer group as the workers. DLQ retry re-publishes the original message and removes it from the DLQ.
+- The main Redis client has an `error` listener, so a dropped connection no longer crashes the process.
+
+### Added
+
+- `withWorkers(count, streams, options)` with `handlersDir`, `config`, and timeout, retry, claim, and restart tuning.
+- `GET /workers/:stream/pending`, and per-worker state on `GET /workers`.
+- Handler context fields `stream`, `id`, `redis`, and `config`.
+- Stream naming helpers `groupName`, `consumerName`, `dlqStream`, `streamForEventType`.
+- `shutdown()` drains and stops worker threads before closing Redis.
+
+### Changed
+
+- The consumer group is now `<service name>:consumer-group`, and `ctx.service` is now the service name instead of the stream.
+- `/workers` stream routes only accept subscribed streams, and return 404 for any other stream.
+- Workers are not started when no handler files are found. Previously every message would have been acknowledged and dropped.
+- CI starts a Redis service and builds before running tests.
+
 ## 1.1.1 - 2026-07-27
 
 ### Changed

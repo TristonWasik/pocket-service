@@ -1,5 +1,8 @@
 export * from "./core/service";
 export * from "./runtime/stream-handler";
+export * from "./runtime/stream-names";
+export type { ConsumerOptions } from "./runtime/consumer";
+export type { WorkerOptions, WorkerState } from "./core/service/workers";
 export * from "./core/types";
 export * from "./api/express-types";
 export * from "./auth/strategies";

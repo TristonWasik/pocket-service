@@ -18,8 +18,7 @@ function makeContext(): ServiceLifecycleContext {
       warn: vi.fn(),
       error: vi.fn(),
     },
-    loadHandlers: vi.fn(),
-    runWorkers: vi.fn(),
+    startWorkers: vi.fn(),
     connectRedis: vi.fn(async () => true),
     register: vi.fn(async () => undefined),
     heartbeat: vi.fn(async () => undefined),
@@ -42,8 +41,7 @@ describe("service/lifecycle helpers", () => {
     initializeDependencies(ctx);
     await flush();
 
-    expect(ctx.loadHandlers).toHaveBeenCalledTimes(1);
-    expect(ctx.runWorkers).toHaveBeenCalledTimes(1);
+    expect(ctx.startWorkers).toHaveBeenCalledTimes(1);
     expect(ctx.connectRedis).toHaveBeenCalledTimes(1);
     expect(ctx.register).toHaveBeenCalledTimes(1);
     expect(ctx.heartbeat).toHaveBeenCalledTimes(1);
@@ -62,8 +60,7 @@ describe("service/lifecycle helpers", () => {
     expect(ctx.log.warn).toHaveBeenCalledWith(
       "Worker module not initialized. Call withWorkers() to enable worker threads and dynamically load handlers.",
     );
-    expect(ctx.loadHandlers).not.toHaveBeenCalled();
-    expect(ctx.runWorkers).not.toHaveBeenCalled();
+    expect(ctx.startWorkers).not.toHaveBeenCalled();
   });
 
   it("logs unknown dependency keys", async () => {

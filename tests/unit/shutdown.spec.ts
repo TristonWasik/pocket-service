@@ -7,6 +7,7 @@ import {
 function makeContext(): ServiceShutdownContext {
   return {
     dependencies: new Map<string, unknown>(),
+    stopWorkers: vi.fn(async () => undefined),
     quitRedis: vi.fn(async () => true),
     disconnectMongo: vi.fn(async () => true),
     closeClickhouse: vi.fn(async () => true),
@@ -36,6 +37,9 @@ describe("service/shutdown helper", () => {
     const events: string[] = [];
     (ctx.setStatus as any).mockImplementation((status: string) => {
       events.push(`status:${status}`);
+    });
+    (ctx.stopWorkers as any).mockImplementation(async () => {
+      events.push("workers");
     });
     (ctx.quitRedis as any).mockImplementation(async () => {
       events.push("redis");
@@ -72,6 +76,7 @@ describe("service/shutdown helper", () => {
     expect(events).toEqual([
       "before",
       "status:stopping",
+      "workers",
       "redis",
       "mongo",
       "clickhouse",
