@@ -33,6 +33,7 @@ Use this as the quick reference, then jump to examples.
 | `await build()` | Connects every module, starts workers and the HTTP server, and resolves when the service is ready. Rejects (after cleaning up) if anything fails. See [Lifecycle and shutdown](#lifecycle-and-shutdown). |
 | `await shutdown(opts?)` | Graceful shutdown. Doesn't exit the process. |
 | `register()` / `heartbeat()` | Service registry in Redis. `build()` starts both automatically. |
+| `await publish(event, data, opts?)` | Validates and publishes a typed event ([Typed events](#typed-events)) |
 
 ### Builder methods (chainable)
 
@@ -52,11 +53,14 @@ Use this as the quick reference, then jump to examples.
 | `withoutDefaultHeaderAuthFallback()` | Disable `x-user-id` header auth |
 | `withoutExpress()` | No HTTP server (worker-only or module-only services) |
 | `withSignalHandlers(enabled?, options?)` | SIGINT/SIGTERM handling ([Lifecycle and shutdown](#lifecycle-and-shutdown)) |
+| `withEnv(schema, source?)` | Validated, typed `service.env` ([Environment variables](#environment-variables)) |
+| `withOpenApi(options?)` | Serve `/openapi.json` ([OpenAPI](#openapi)) |
+| `withRateLimits(options?)` | Redis-backed rate limiting ([Rate limiting](#rate-limiting)) |
 | `addRouter(base, router, routes?)` | Register a router ([Example: addRouter + createMetaRouter](#example-addrouter--createmetarouter)) |
 
 ### Public getters
 
-`streamKey`, `simpleName`, `fullUrl`, `status`, `routes`, `api`, `log`, `redis`, `mongo`, `db`, `clickhouse`
+`streamKey`, `simpleName`, `fullUrl`, `status`, `routes`, `api`, `log`, `redis`, `mongo`, `db`, `clickhouse`, `env` ([withEnv](#environment-variables)), `discovery` ([Service discovery](#service-discovery))
 
 ### Symbols
 
@@ -116,6 +120,27 @@ await using service = await new Service().withPort(0).build();
 
 Explicit builder arguments always win over environment variables.
 
+### Typed environment with `withEnv`
+
+`withEnv(schema)` validates the environment with a Zod schema and exposes the typed result as `service.env`. It parses immediately, so the values can feed later builder calls. Any invalid variables throw one error that lists them all.
+
+```ts
+import z from "zod";
+
+const service = new Service().withEnv(
+  z.object({
+    REDIS_URL: z.url(),
+    WORKERS: z.coerce.number().int().default(2),
+    STRIPE_KEY: z.string().min(1),
+  }),
+);
+
+await service
+  .withRedis(service.env.REDIS_URL)
+  .withWorkers(service.env.WORKERS, ["billing:events"])
+  .build();
+```
+
 ## Examples
 
 Use the Service class to streamline setup and reduce boilerplate.
@@ -132,10 +157,22 @@ This includes an Express server with a few [built-in endpoints](#built-in-endpoi
 
 Base routes:
 
-| Method | Route   | Description                                |
-| ------ | ------- | ------------------------------------------ |
-| GET    | /       | OK Check                                   |
-| GET    | /health | Used for health information on the service |
+| Method | Route         | Description                                                        |
+| ------ | ------------- | ------------------------------------------------------------------ |
+| GET    | /             | OK check                                                           |
+| GET    | /health       | Service status, uptime, modules, routes and handlers               |
+| GET    | /health/live  | Liveness probe: always 200 while the process is up                 |
+| GET    | /health/ready | Readiness probe: 200 when running and every dependency responds, otherwise 503 |
+
+`/health/ready` pings Redis, MongoDB and ClickHouse, and calls each custom module's optional `ready()` hook, with a 2s timeout per check. The response lists every check:
+
+```json
+{ "status": "not_ready", "checks": { "redis": "ok", "mongo": "connect ECONNREFUSED" } }
+```
+
+Point your Kubernetes `livenessProbe` at `/health/live` and `readinessProbe` at `/health/ready`.
+
+Unknown routes return a JSON `404` (see [Errors and request IDs](#errors-and-request-ids)).
 
 ### Modules
 
@@ -676,11 +713,172 @@ const metrics = defineMongoCollection({
 });
 ```
 
+## Errors and request IDs
+
+Throw `HttpError` from any route handler, including async ones, to send an error response:
+
+```ts
+import { HttpError } from "@twasik4/pocket-service";
+
+addRoute({ method: "GET", fullPath: "/users/:id" }, async (req, res) => {
+  const user = await service.db.users.getOne({ id: req.params.id });
+  if (!user) {
+    throw new HttpError(404, "User not found", { code: "USER_NOT_FOUND" });
+  }
+  res.json(user);
+});
+```
+
+Every built-in error uses the same envelope:
+
+```json
+{ "isSuccess": false, "message": "User not found", "code": "USER_NOT_FOUND", "requestId": "3f2c..." }
+```
+
+- **`HttpError`** sends its status, message, `code` and `details`.
+- **Validation failures** (body, params or query) return `400`, with the Zod issues in `details`.
+- **Malformed JSON** returns `400`, and unknown routes return `404`.
+- **Any other error** returns `500` with `"Internal server error"`. The real error and its stack are logged, never sent to the client.
+
+Every request gets an ID: the incoming `x-request-id` header if it's safe to reuse (up to 128 characters from `[A-Za-z0-9_.:-]`), otherwise a new UUID. The ID is echoed in the `x-request-id` response header and available as `req.id`. `req.log` is a logger that tags each line with the ID:
+
+```ts
+req.log.info("charging card"); // ... info: charging card (req 3f2c...)
+```
+
+### Query validation
+
+`queryValidator` validates and replaces `req.query`, just like `bodyValidator` and `paramsValidator`. Query values arrive as strings, so use `z.coerce` for numbers and booleans:
+
+```ts
+addRoute(
+  {
+    method: "GET",
+    fullPath: "/search",
+    queryValidator: z.object({
+      q: z.string().min(1),
+      limit: z.coerce.number().int().max(50).default(10),
+    }),
+  },
+  (req, res) => {
+    res.json(search(req.query.q, req.query.limit)); // limit is a number
+  },
+);
+```
+
+## Typed events
+
+`defineEvent` gives an event a type and a Zod schema. Put the definitions in code that both the producer and the consumer import:
+
+```ts
+import z from "zod";
+import { defineEvent } from "@twasik4/pocket-service";
+
+export const UserCreated = defineEvent(
+  "auth:user-created",
+  z.object({ userId: z.string(), plan: z.enum(["free", "pro"]) }),
+);
+```
+
+Publish from any service with Redis. The payload is validated first, and an invalid payload throws:
+
+```ts
+await service.publish(UserCreated, { userId: "u_1", plan: "pro" });
+```
+
+Handle it in a worker with a typed handler. `data` is typed from the schema:
+
+```ts
+// src/handlers/user-created.ts
+export default redisStreamHandler(UserCreated, async (data, ctx) => {
+  ctx.log.info(`New ${data.plan} user ${data.userId}`);
+  await ctx.publish(WelcomeEmailRequested, { userId: data.userId });
+});
+```
+
+- Typed events are written as `{ eventType, payload }`, with the payload JSON-encoded, so numbers, booleans and nested objects keep their types. Use `z.coerce.date()` for dates.
+- If a payload fails validation in the consumer, it goes straight to the DLQ without retries, because retrying can't fix it.
+- A typed handler also accepts flat string fields from untyped producers (`ctx.emit` or a raw `XADD`), parsing them with the schema. Use `z.coerce` for non-string fields.
+- `publish(event, data, { maxLen })` trims the stream to about `maxLen` entries.
+
+## OpenAPI
+
+`withOpenApi()` serves an OpenAPI 3.1 document at `/openapi.json`. It's generated from your `createMetaRouter` routes, including the Zod validators:
+
+```ts
+await new Service()
+  .withOpenApi({
+    info: { title: "Billing API", version: "2.0.0" },
+    servers: [{ url: "https://billing.example.com" }],
+  })
+  .addRouter("/api", router, routes)
+  .build();
+```
+
+- Paths, path and query parameters, and JSON request bodies come from `paramsValidator`, `queryValidator` and `bodyValidator`.
+- `meta.description`, `meta.tags`, `meta.deprecated` and `meta.operationId` map to the operation.
+- `requireAuth` routes get the security schemes, which default to bearer auth. Pass `securitySchemes` to change them.
+- Error responses (`400`, `401`, `429`) reference a shared `Error` schema.
+
+Point Swagger UI, Postman, or a client generator at the URL.
+
+## Rate limiting
+
+Pick a tier per route with `meta.rateLimit`, then turn limiting on with `withRateLimits()`:
+
+```ts
+addRoute(
+  { method: "POST", fullPath: "/login", meta: { rateLimit: "strict" } },
+  loginHandler,
+);
+
+await new Service()
+  .withRedis()
+  .withRateLimits({
+    standard: { limit: 100, windowMs: 60_000 }, // default
+    strict: { limit: 5, windowMs: 60_000 },
+    default: "none", // tier for routes without meta.rateLimit
+  })
+  .addRouter("/auth", router, routes)
+  .build();
+```
+
+- **Callers** are identified by the authenticated user ID, then by IP. Pass `keyBy(req)` to change this, and set `withExpressOptions({ trustProxy: true })` behind a load balancer.
+- **Counters live in Redis** when the service has it, so limits are shared by every instance. Without Redis, limits are per process.
+- **If Redis is unavailable,** requests are allowed through and a warning is logged.
+- **Limited routes** send `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` headers. Over the limit, the response is `429` with `Retry-After`.
+
+Routes with `meta.deprecated` send a `Deprecation` header: `true`, or `@<unix seconds>` when you pass a `Date`.
+
+## Service discovery
+
+Every service with Redis registers itself and refreshes its entry every 5 seconds. `service.discovery` reads that registry:
+
+```ts
+const services = await service.discovery.list();
+const billing = await service.discovery.get("billing"); // also matches "billing-service"
+
+addRoute({ method: "GET", fullPath: "/invoices" }, async (req, res) => {
+  const upstream = await service.discovery.fetch(
+    "billing",
+    "/api/invoices",
+    {},
+    { forward: req }, // copies Authorization and the request ID
+  );
+  res.status(upstream.status).json(await upstream.json());
+});
+```
+
+`discovery.fetch` throws `HttpError(503)` (code `SERVICE_UNAVAILABLE`) when the service isn't registered. Lookups are cached for 5 seconds. Replicas of a service share one registry entry, so `get` returns whichever replica refreshed last. Use a load balancer URL with `withUrl()` when you run several replicas.
+
 ### Utilities You Can Use
 
 The package also exports:
 
-- `redisStreamHandler()` to build strongly typed Redis stream handlers
+- `redisStreamHandler()` to build Redis stream handlers, typed when given a `defineEvent()` definition
+- `HttpError` and `requestContext()` for errors and request IDs
+- `buildOpenApiDocument()` to generate an OpenAPI document yourself
+- `createRedisRateLimitStore()` / `createMemoryRateLimitStore()` rate-limit stores
 - `groupName()`, `dlqStream()`, `streamForEventType()` stream naming helpers
 - `createMetaRouter()` and route typing helpers
 - Mongo helpers (`defineMongoCollection`, `createMongo`, `CollectionWrapper`)
@@ -723,6 +921,9 @@ await service.redis.xAdd("auth:events", "*", {
 - **CORS:** the default `corsWhitelist: ["*"]` now actually allows any origin. Combining `"*"` with `credentials: true` is rejected.
 - **Workers:** the consumer group is now `<service name>:consumer-group`, and events use an `eventType` field. See [withWorkers](#example-withworkers).
 - **Ports:** `SERVICE_PORT` now takes precedence over `PORT` everywhere.
+- **Error responses:** validation failures put the Zod issues in `details` (previously `error`). Every error response includes `requestId`. Unknown routes return a JSON `404`, and unhandled errors return a JSON `500` instead of Express's HTML pages.
+- **`/workers` errors** (unknown stream, missing DLQ message) use the standard error envelope.
+- **`Service` has a second type parameter** (`Service<TCollections, TEnv>`) for `withEnv`. Annotations like `Service<MyCollections>` still work.
 - **Removed:** `getRegisteredRoutes()`, the `Message` type, and `RouteMeta.authRequired` (use `requireAuth`).
 
 ## Contributor layout

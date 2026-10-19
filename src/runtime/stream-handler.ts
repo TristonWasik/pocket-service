@@ -1,4 +1,5 @@
 import type { RedisClientType } from "redis";
+import type { EventData, EventDefinition, EventInput } from "./events";
 import { streamForEventType } from "./stream-names";
 
 /**
@@ -27,6 +28,14 @@ export type RedisStreamHandlerContext = {
    * `type` before the first `:`.
    */
   emit: (ev: RedisStreamEmitInput) => Promise<void>;
+  /**
+   * Validates and publishes a typed event defined with `defineEvent()`.
+   * Resolves with the new stream entry ID.
+   */
+  publish: <TEvent extends EventDefinition>(
+    event: TEvent,
+    data: EventInput<TEvent>,
+  ) => Promise<string>;
   /** The worker thread's own Redis connection. */
   redis: RedisClientType;
   /** Value passed as `config` to `withWorkers()`. */
@@ -38,19 +47,48 @@ export type RedisStreamHandlerContext = {
   };
 };
 
-export type RedisStreamEventHandler = {
-  type: string;
-  execute: (
-    ev: RedisStreamEvent,
-    ctx: RedisStreamHandlerContext,
-  ) => Promise<void>;
+/**
+ * Minimal Zod-compatible parser, so the consumer does not depend on a
+ * specific Zod instance.
+ */
+export type PayloadSchema = {
+  safeParse: (
+    value: unknown,
+  ) =>
+    | { success: true; data: unknown }
+    | { success: false; error: { message: string } };
 };
 
+export type RedisStreamEventHandler = {
+  type: string;
+  /** Present for typed handlers; the payload is validated before execute. */
+  schema?: PayloadSchema;
+  execute: (ev: any, ctx: RedisStreamHandlerContext) => Promise<void>;
+};
+
+/**
+ * Handles a typed event. The payload is validated against the event's schema
+ * before the handler runs; invalid payloads go straight to the DLQ.
+ */
+export function redisStreamHandler<TEvent extends EventDefinition>(
+  event: TEvent,
+  fn: (data: EventData<TEvent>, ctx: RedisStreamHandlerContext) => Promise<void>,
+): RedisStreamEventHandler;
+/**
+ * Handles an untyped event, receiving the raw flat string fields.
+ */
 export function redisStreamHandler(
   type: string,
-  fn: RedisStreamEventHandler["execute"],
+  fn: (ev: RedisStreamEvent, ctx: RedisStreamHandlerContext) => Promise<void>,
+): RedisStreamEventHandler;
+export function redisStreamHandler(
+  typeOrEvent: string | EventDefinition,
+  fn: (ev: any, ctx: RedisStreamHandlerContext) => Promise<void>,
 ): RedisStreamEventHandler {
-  return { type, execute: fn };
+  if (typeof typeOrEvent === "string") {
+    return { type: typeOrEvent, execute: fn };
+  }
+  return { type: typeOrEvent.type, schema: typeOrEvent.schema, execute: fn };
 }
 
 /**

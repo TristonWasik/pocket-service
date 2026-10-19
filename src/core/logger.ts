@@ -10,8 +10,10 @@ export const createLogger = <T = string>(service: T) =>
           format.colorize(),
           format.timestamp(),
           format.printf(
-            ({ level, message, timestamp }) =>
-              `${timestamp} [${service}] ${level}: ${message}`,
+            ({ level, message, timestamp, requestId }) =>
+              `${timestamp} [${service}] ${level}: ${message}${
+                requestId ? ` (req ${requestId})` : ""
+              }`,
           ),
         ),
       }),

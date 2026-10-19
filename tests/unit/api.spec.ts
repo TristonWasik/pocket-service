@@ -9,11 +9,13 @@ import {
   closeHttpServer,
   type ServiceApiRuntimeContext,
 } from "../../src/core/service/api";
+import { createLogger } from "../../src/core/logger";
 
 function makeContext(): ServiceApiRuntimeContext {
   const use = vi.fn();
 
   return {
+    logger: createLogger("api-test"),
     withoutExpressFlag: false,
     expressOptions: {
       asJson: false,
@@ -47,6 +49,7 @@ function makeContext(): ServiceApiRuntimeContext {
       xPending: vi.fn(async () => ({})),
     }),
     getAuthResolver: () => async () => ({ userId: "u-1" }),
+    getReadinessChecks: () => ({}),
     internalAddRouter: vi.fn(),
   };
 }

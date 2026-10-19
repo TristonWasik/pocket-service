@@ -1,7 +1,7 @@
 import { setTimeout as sleep } from "timers/promises";
 import type { RedisClientType } from "redis";
+import { encodeEvent } from "./events";
 import {
-  RedisStreamEvent,
   RedisStreamEventHandler,
   RedisStreamHandlerContext,
   toStreamFields,
@@ -114,7 +114,59 @@ export function createStreamConsumer(cfg: StreamConsumerConfig) {
         const { stream: target, fields } = toStreamFields(ev);
         await redis.xAdd(target, "*", fields);
       },
+      publish: async (event, data) => {
+        const { stream: target, fields } = encodeEvent(event, data);
+        return redis.xAdd(target, "*", fields);
+      },
     };
+  }
+
+  /**
+   * Typed events carry a JSON `payload` field. Entries without one (for
+   * example from an untyped producer) are parsed from their flat fields.
+   */
+  function decodePayload(
+    handler: RedisStreamEventHandler,
+    message: Record<string, string>,
+  ): { ok: true; data: unknown } | { ok: false; error: string } {
+    if (!handler.schema) {
+      return { ok: true, data: message };
+    }
+    let raw: unknown;
+    if (message.payload !== undefined) {
+      try {
+        raw = JSON.parse(message.payload);
+      } catch {
+        return { ok: false, error: "Invalid payload: not valid JSON" };
+      }
+    } else {
+      const { eventType: _, ...fields } = message;
+      raw = fields;
+    }
+    const result = handler.schema.safeParse(raw);
+    return result.success
+      ? { ok: true, data: result.data }
+      : { ok: false, error: `Invalid payload: ${result.error.message}` };
+  }
+
+  async function deadLetter(
+    stream: string,
+    id: string,
+    message: Record<string, string>,
+    error: string,
+    attempts: number,
+  ) {
+    await redis.xAdd(dlqStream(stream), "*", {
+      originalId: id,
+      stream,
+      eventType: message.eventType ?? "",
+      message: JSON.stringify(message),
+      error,
+      attempts: String(attempts),
+      failedAt: new Date().toISOString(),
+    });
+    await redis.xAck(stream, group, id);
+    log.error(`Moved ${stream} ${id} to ${dlqStream(stream)}: ${error}`);
   }
 
   async function runWithTimeout(run: () => Promise<void>) {
@@ -148,14 +200,18 @@ export function createStreamConsumer(cfg: StreamConsumerConfig) {
       return;
     }
 
+    // Retrying cannot fix a malformed payload, so it is dead-lettered now.
+    const decoded = decodePayload(handler, message);
+    if (!decoded.ok) {
+      await deadLetter(stream, id, message, decoded.error, 0);
+      return;
+    }
+
     let lastError: unknown;
     for (let attempt = 1; attempt <= opts.maxRetries; attempt++) {
       try {
         await runWithTimeout(() =>
-          handler.execute(
-            message as RedisStreamEvent,
-            buildContext(stream, id),
-          ),
+          handler.execute(decoded.data, buildContext(stream, id)),
         );
         await redis.xAck(stream, group, id);
         return;
@@ -175,17 +231,13 @@ export function createStreamConsumer(cfg: StreamConsumerConfig) {
       }
     }
 
-    await redis.xAdd(dlqStream(stream), "*", {
-      originalId: id,
+    await deadLetter(
       stream,
-      eventType,
-      message: JSON.stringify(message),
-      error: errorMessage(lastError),
-      attempts: String(opts.maxRetries),
-      failedAt: new Date().toISOString(),
-    });
-    await redis.xAck(stream, group, id);
-    log.error(`Moved ${stream} ${id} to ${dlqStream(stream)}`);
+      id,
+      message,
+      errorMessage(lastError),
+      opts.maxRetries,
+    );
   }
 
   async function claimStale() {

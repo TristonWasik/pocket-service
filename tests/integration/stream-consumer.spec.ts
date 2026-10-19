@@ -1,6 +1,8 @@
 /// <reference types="vitest/globals" />
 import { randomBytes } from "crypto";
 import { createClient, RedisClientType } from "redis";
+import z from "zod";
+import { defineEvent, encodeEvent } from "../../src/runtime/events";
 import { createStreamConsumer } from "../../src/runtime/consumer";
 import {
   redisStreamHandler,
@@ -179,6 +181,96 @@ describe("Redis stream consumer", () => {
     await admin.xAdd(stream, "*", { eventType: `${prefix}:ping`, n: "after" });
 
     await waitFor(async () => seen.includes("after"));
+  });
+
+  it("delivers typed events with their original types", async () => {
+    const Order = defineEvent(
+      `${prefix}:order`,
+      z.object({
+        total: z.number(),
+        paid: z.boolean(),
+        items: z.array(z.object({ sku: z.string(), qty: z.number() })),
+      }),
+    );
+    const seen: unknown[] = [];
+    await startConsumer([
+      redisStreamHandler(Order, async (order) => {
+        seen.push(order);
+      }),
+    ]);
+
+    const { fields } = encodeEvent(Order, {
+      total: 12.5,
+      paid: true,
+      items: [{ sku: "A1", qty: 2 }],
+    });
+    await admin.xAdd(stream, "*", fields);
+
+    await waitFor(async () => seen.length === 1);
+    expect(seen[0]).toEqual({
+      total: 12.5,
+      paid: true,
+      items: [{ sku: "A1", qty: 2 }],
+    });
+  });
+
+  it("dead-letters invalid typed payloads without retrying", async () => {
+    const Order = defineEvent(`${prefix}:order`, z.object({ total: z.number() }));
+    const handler = vi.fn(async () => {});
+    await startConsumer([redisStreamHandler(Order, handler)], {
+      maxRetries: 3,
+    });
+
+    await admin.xAdd(stream, "*", {
+      eventType: `${prefix}:order`,
+      payload: JSON.stringify({ total: "lots" }),
+    });
+
+    await waitFor(async () => (await admin.xLen(dlqStream(stream))) === 1);
+    const [entry] = await admin.xRange(dlqStream(stream), "-", "+");
+    expect(handler).not.toHaveBeenCalled();
+    expect(entry.message.attempts).toBe("0");
+    expect(entry.message.error).toContain("Invalid payload");
+    expect((await admin.xPending(stream, groupName(service))).pending).toBe(0);
+  });
+
+  it("parses flat fields from untyped producers with coercing schemas", async () => {
+    const Ping = defineEvent(
+      `${prefix}:ping`,
+      z.object({ n: z.coerce.number() }),
+    );
+    const seen: number[] = [];
+    await startConsumer([
+      redisStreamHandler(Ping, async ({ n }) => {
+        seen.push(n);
+      }),
+    ]);
+
+    await admin.xAdd(stream, "*", { eventType: `${prefix}:ping`, n: "7" });
+
+    await waitFor(async () => seen.length === 1);
+    expect(seen).toEqual([7]);
+  });
+
+  it("publishes typed events from a handler", async () => {
+    const In = defineEvent(`${prefix}:in`, z.object({ userId: z.string() }));
+    const Out = defineEvent(
+      `${prefix}out:done`,
+      z.object({ userId: z.string(), at: z.number() }),
+    );
+    await startConsumer([
+      redisStreamHandler(In, async ({ userId }, ctx) => {
+        await ctx.publish(Out, { userId, at: 1 });
+      }),
+    ]);
+
+    await admin.xAdd(stream, "*", encodeEvent(In, { userId: "u9" }).fields);
+
+    const outStream = `${prefix}out:events`;
+    await waitFor(async () => (await admin.xLen(outStream)) === 1);
+    const [entry] = await admin.xRange(outStream, "-", "+");
+    expect(entry.message.eventType).toBe(`${prefix}out:done`);
+    expect(JSON.parse(entry.message.payload)).toEqual({ userId: "u9", at: 1 });
   });
 
   it("stops promptly while blocked on XREADGROUP", async () => {
