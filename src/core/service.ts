@@ -1,5 +1,5 @@
 import express, { Express, Router } from "express";
-import { createClient, RedisClientType } from "redis";
+import { RedisClientType } from "redis";
 import { Logger } from "winston";
 import {
   AuthResolver,
