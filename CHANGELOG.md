@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.0.1 - 2026-10-21
+
+### Fixed
+
+- The package could not be resolved under TypeScript's `node10` module resolution, which editors use for projects without a tsconfig, so `req` and `res` in route handlers became `any`. Restored the top-level `main` and `types` fields alongside `exports`.
+- Express request and response types fell back to `any` in projects that hadn't installed `@types/express` themselves. `@types/express` is now a dependency, because the public types are built on it.
+- CI now type-checks the packed package from a fresh consumer project under the `node10`, `bundler` and `nodenext` resolution modes.
+
 ## 2.0.0 - 2026-10-19
 
 ### Breaking
