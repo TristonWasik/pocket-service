@@ -55,6 +55,10 @@ jobs:
       - name: Build
         run: pnpm build
 
+      # Type-checks the packed package from a fresh consumer project.
+      - name: Check consumer types
+        run: pnpm check:types
+
       - name: Run tests
         env:
           MONGOMS_DOWNLOAD_DIR: ${{ github.workspace }}/.cache/mongodb-binaries
