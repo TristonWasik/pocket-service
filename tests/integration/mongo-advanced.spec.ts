@@ -107,10 +107,17 @@ describe("Mongo abstraction advanced behaviors", () => {
           schema: z.object({
             email: z.string(),
             createdAt: z.date(),
+            sso: z.object({ id: z.string() }).optional(),
           }),
           indexes: [
             { key: { email: 1 }, unique: true, name: "users_email_unique" },
             { key: { createdAt: 1 }, name: "users_created_at" },
+            {
+              key: { "sso.id": 1 },
+              unique: true,
+              name: "users_sso_id_unique",
+              partialFilterExpression: { "sso.id": { $exists: true } },
+            },
           ],
         }),
       },
@@ -123,6 +130,10 @@ describe("Mongo abstraction advanced behaviors", () => {
 
     expect(indexes.some((idx) => idx.name === "users_email_unique")).toBe(true);
     expect(indexes.some((idx) => idx.name === "users_created_at")).toBe(true);
+    expect(
+      indexes.find((idx) => idx.name === "users_sso_id_unique")
+        ?.partialFilterExpression,
+    ).toEqual({ "sso.id": { $exists: true } });
 
     await mongo.disconnect();
   });
