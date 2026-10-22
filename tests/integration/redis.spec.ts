@@ -6,7 +6,7 @@ describe("Redis Dependency", () => {
 
   beforeAll(async () => {
     service = await new Service()
-      .withName("admin-service")
+      .withName("redis-spec-service")
       .withPort(3103)
       .withRedis("redis://localhost:6379")
       .build();
@@ -21,11 +21,13 @@ describe("Redis Dependency", () => {
   });
 
   it("Should register the service in redis during build", async () => {
-    const value = await service.redis.get("services:registry:admin-service");
+    const value = await service.redis.get(
+      "services:registry:redis-spec-service",
+    );
     expect(value).not.toBeNull();
     const parsedValue = JSON.parse(value!);
-    expect(parsedValue.name).toBe("admin-service");
-    expect(parsedValue.streamKey).toBe("admin:events");
+    expect(parsedValue.name).toBe("redis-spec-service");
+    expect(parsedValue.streamKey).toBe("redis:events");
     expect(parsedValue.url).toBe("http://localhost:3103");
     expect(parsedValue.dependencies).toEqual(["redis"]);
     expect(

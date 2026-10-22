@@ -23,6 +23,10 @@ export type MongoIndexSpec = {
    */
   sparse?: boolean;
   /**
+   * Only index documents matching this filter. Example: { "sso.id": { $exists: true } }
+   */
+  partialFilterExpression?: Document;
+  /**
    * Whether to build the index in the background without blocking other operations.
    */
   background?: boolean;
